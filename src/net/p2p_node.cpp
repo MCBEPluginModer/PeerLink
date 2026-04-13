@@ -64,6 +64,14 @@ std::string TrimCopy(std::string value) {
     return value;
 }
 
+MessageId GenerateMessageIdForNode(const NodeId& nodeId) {
+    static std::atomic<std::uint64_t> counter{1};
+    const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    const auto nodeHash = static_cast<std::uint64_t>(std::hash<std::string>{}(nodeId));
+    return (now << 16) ^ (counter.fetch_add(1, std::memory_order_relaxed) & 0xFFFFull) ^ (nodeHash & 0xFFFFull);
+}
+
 bool HexToBytesLocal(const std::string& hex, p2p::ByteVector& out) {
     if (hex.size() % 2 != 0) return false;
     out.clear();
@@ -745,7 +753,7 @@ void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& 
     if (!sessionIdOpt) { utils::LogError("No private session with this user"); return; }
 
     PrivateMessagePayload payload{};
-    payload.messageId = utils::GeneratePacketId();
+    payload.messageId = GenerateMessageIdForNode(local_.nodeId);
     payload.sessionId = *sessionIdOpt;
     payload.fromNodeId = local_.nodeId;
     payload.fromNickname = local_.nickname;
@@ -764,7 +772,10 @@ void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& 
         delivered = RelayPrivateMessageToNetwork(payload);
     }
 
-    AppendStoredPrivateMessage(payload, StoredMessageDirection::Outgoing, localPublicKeyBlob_);
+    StoredMessageState state = StoredMessageState::Failed;
+    if (delivered && peerManager_.FindByNodeId(targetNodeId)) state = StoredMessageState::Sent;
+    else if (delivered) state = StoredMessageState::Relayed;
+    AppendStoredPrivateMessage(payload, StoredMessageDirection::Outgoing, state, localPublicKeyBlob_);
     if (!delivered) {
         utils::LogError("Target peer is not connected and there is no relay path right now");
     } else if (!peerManager_.FindByNodeId(targetNodeId)) {
@@ -792,9 +803,13 @@ void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, 
     }
 
     if (p.toNodeId != local_.nodeId) return;
+    if (HasStoredMessageForPeer(p.fromNodeId, p.messageId)) {
+        SendDeliveryAck(p, 0);
+        return;
+    }
 
     EnsureSessionForPeer(p.fromNodeId, p.fromNickname, p.sessionId);
-    AppendStoredPrivateMessage(p, StoredMessageDirection::Incoming, pub);
+    AppendStoredPrivateMessage(p, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
     SendDeliveryAck(p, 0);
     utils::LogPrivate(p.fromNickname, p.text);
 }
@@ -823,6 +838,7 @@ void P2PNode::HandleMessageAck(const std::shared_ptr<PeerConnection>& peer, Pack
         deliveredOutgoingMessageIds_.insert(ack.messageId);
     }
 
+    UpdateStoredMessageState(ack.fromNodeId, ack.messageId, StoredMessageState::Delivered);
     utils::LogSystem("Message delivered: id=" + std::to_string(ack.messageId));
 }
 
@@ -1066,9 +1082,9 @@ void P2PNode::HandleRelayPrivateMessage(const std::shared_ptr<PeerConnection>& p
         }
         if (inner.toNodeId != local_.nodeId) return;
 
-        if (router_.MarkSeen(inner.messageId)) {
+        if (router_.MarkSeen(inner.messageId) && !HasStoredMessageForPeer(inner.fromNodeId, inner.messageId)) {
             EnsureSessionForPeer(inner.fromNodeId, inner.fromNickname, inner.sessionId);
-            AppendStoredPrivateMessage(inner, StoredMessageDirection::Incoming, pub);
+            AppendStoredPrivateMessage(inner, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
             utils::LogPrivate(inner.fromNickname, inner.text);
         }
         SendDeliveryAck(inner, relay.relayPacketId);
@@ -1321,7 +1337,7 @@ void P2PNode::HandleHistorySyncResponse(const std::shared_ptr<PeerConnection>& p
         if (exists) continue;
         if (!signer_.Verify(BuildPrivateMessageSignedData(msg), msg.signature, pub)) continue;
         EnsureSessionForPeer(resp.responderNodeId, peer ? peer->GetRemoteNickname() : std::string(), msg.sessionId);
-        AppendStoredPrivateMessage(msg, StoredMessageDirection::Incoming, pub);
+        AppendStoredPrivateMessage(msg, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
         ++imported;
     }
     if (imported > 0) {
@@ -1417,7 +1433,7 @@ void P2PNode::HandleUdpPunchRequest(const std::shared_ptr<PeerConnection>& peer,
     BroadcastRaw(packet, peer ? peer->GetRemoteNodeId() : "");
 }
 
-void P2PNode::AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, const ByteVector& signerPublicKeyBlob) {
+void P2PNode::AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, StoredMessageState state, const ByteVector& signerPublicKeyBlob) {
     const NodeId peerNodeId = (direction == StoredMessageDirection::Outgoing) ? payload.toNodeId : payload.fromNodeId;
     std::string error;
     if (!ConversationStore::AppendPrivateMessage(historyRootDir_,
@@ -1425,12 +1441,32 @@ void P2PNode::AppendStoredPrivateMessage(const PrivateMessagePayload& payload, S
                                                  peerNodeId,
                                                  payload,
                                                  direction,
+                                                 state,
                                                  signerPublicKeyBlob,
                                                  signer_,
                                                  localPublicKeyBlob_,
                                                  &error)) {
         utils::LogError("Failed to store private message: " + error);
     }
+}
+
+bool P2PNode::HasStoredMessageForPeer(const NodeId& peerNodeId, MessageId messageId) const {
+    bool exists = false;
+    std::string error;
+    if (!ConversationStore::HasMessageId(historyRootDir_, local_.nodeId, peerNodeId, messageId, const_cast<CryptoSigner&>(signer_), &exists, &error)) {
+        if (!error.empty()) utils::LogError("Failed to check stored message id: " + error);
+        return false;
+    }
+    return exists;
+}
+
+bool P2PNode::UpdateStoredMessageState(const NodeId& peerNodeId, MessageId messageId, StoredMessageState newState) {
+    std::string error;
+    if (!ConversationStore::UpdateMessageState(historyRootDir_, local_.nodeId, peerNodeId, messageId, newState, signer_, localPublicKeyBlob_, &error)) {
+        if (!error.empty()) utils::LogError("Failed to update message state: " + error);
+        return false;
+    }
+    return true;
 }
 
 void P2PNode::EnsureSessionForPeer(const NodeId& peerNodeId, const std::string& peerNickname, SessionId sessionId) {
@@ -1463,7 +1499,18 @@ void P2PNode::PrintStoredConversation(const NodeId& peerNodeId, const std::strin
     }
     for (const auto& msg : messages) {
         const std::string author = (msg.direction == StoredMessageDirection::Outgoing) ? local_.nickname : msg.fromNickname;
-        utils::LogRaw("[History | " + author + "] " + msg.text);
+        std::string suffix;
+        if (msg.direction == StoredMessageDirection::Outgoing) {
+            switch (msg.state) {
+                case StoredMessageState::Queued: suffix = " [queued]"; break;
+                case StoredMessageState::Sent: suffix = " [sent]"; break;
+                case StoredMessageState::Relayed: suffix = " [relayed]"; break;
+                case StoredMessageState::Delivered: suffix = " [delivered]"; break;
+                case StoredMessageState::Failed: suffix = " [failed]"; break;
+                default: break;
+            }
+        }
+        utils::LogRaw("[History | " + author + suffix + "] " + msg.text);
     }
 }
 

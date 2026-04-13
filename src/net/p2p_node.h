@@ -95,7 +95,9 @@ private:
     void SendUdpProbeToEndpoint(const std::string& ip, std::uint16_t port);
     void SendUdpPunchBurst(const KnownNode& node, const std::string& reason);
     void HandleUdpDatagram(const std::string& ip, std::uint16_t port, const ByteVector& data);
-    void AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, const ByteVector& signerPublicKeyBlob);
+    void AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, StoredMessageState state, const ByteVector& signerPublicKeyBlob);
+    bool HasStoredMessageForPeer(const NodeId& peerNodeId, MessageId messageId) const;
+    bool UpdateStoredMessageState(const NodeId& peerNodeId, MessageId messageId, StoredMessageState newState);
     bool RelayPrivateMessageToNetwork(const PrivateMessagePayload& payload);
     bool RelayMessageAckToNetwork(const MessageAckPayload& payload);
     void QueueRelayMessage(const RelayPrivateMessagePayload& payload);

@@ -30,6 +30,7 @@ struct StoredRecord {
     std::string signatureHex;
     std::string signerPublicKeyHex;
     std::string storedAtUtc;
+    std::string state;
     std::string prevHashHex;
     std::string recordHashHex;
 };
@@ -110,6 +111,27 @@ std::string CurrentUtcIso8601() {
     return std::string(buffer);
 }
 
+std::string StoredMessageStateToString(StoredMessageState state) {
+    switch (state) {
+        case StoredMessageState::Created: return "created";
+        case StoredMessageState::Queued: return "queued";
+        case StoredMessageState::Sent: return "sent";
+        case StoredMessageState::Relayed: return "relayed";
+        case StoredMessageState::Delivered: return "delivered";
+        case StoredMessageState::Failed: return "failed";
+        default: return "created";
+    }
+}
+
+StoredMessageState StoredMessageStateFromString(const std::string& state) {
+    if (state == "queued") return StoredMessageState::Queued;
+    if (state == "sent") return StoredMessageState::Sent;
+    if (state == "relayed") return StoredMessageState::Relayed;
+    if (state == "delivered") return StoredMessageState::Delivered;
+    if (state == "failed") return StoredMessageState::Failed;
+    return StoredMessageState::Created;
+}
+
 ByteVector Sha256(const ByteVector& data) {
     HCRYPTPROV prov = 0;
     HCRYPTHASH hash = 0;
@@ -160,6 +182,7 @@ ByteVector BuildStoredRecordHashData(const StoredRecord& r) {
     utils::WriteString(out, r.signatureHex);
     utils::WriteString(out, r.signerPublicKeyHex);
     utils::WriteString(out, r.storedAtUtc);
+    utils::WriteString(out, r.state);
     utils::WriteString(out, r.prevHashHex);
     return out;
 }
@@ -189,6 +212,7 @@ std::string SerializeRecordJson(const StoredRecord& r) {
     oss << "\"signature_hex\":\"" << r.signatureHex << "\",";
     oss << "\"signer_public_key_hex\":\"" << r.signerPublicKeyHex << "\",";
     oss << "\"stored_at_utc\":\"" << JsonEscape(r.storedAtUtc) << "\",";
+    oss << "\"state\":\"" << JsonEscape(r.state) << "\",";
     oss << "\"prev_hash_hex\":\"" << r.prevHashHex << "\",";
     oss << "\"record_hash_hex\":\"" << r.recordHashHex << "\"";
     oss << "}";
@@ -246,6 +270,7 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     auto signatureHex = ExtractJsonString(line, "signature_hex");
     auto signerPubHex = ExtractJsonString(line, "signer_public_key_hex");
     auto storedAt = ExtractJsonString(line, "stored_at_utc");
+    auto state = ExtractJsonString(line, "state");
     auto prevHash = ExtractJsonString(line, "prev_hash_hex");
     auto recordHash = ExtractJsonString(line, "record_hash_hex");
     if (!version || !direction || !messageId || !sessionId || !fromNodeId || !fromNickHex || !toNodeId || !textHex ||
@@ -263,6 +288,7 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     r.signatureHex = *signatureHex;
     r.signerPublicKeyHex = *signerPubHex;
     r.storedAtUtc = *storedAt;
+    r.state = state.value_or("created");
     r.prevHashHex = *prevHash;
     r.recordHashHex = *recordHash;
     return r;
@@ -419,6 +445,7 @@ bool ConversationStore::AppendPrivateMessage(const std::string& rootDir,
                                              const NodeId& peerNodeId,
                                              const PrivateMessagePayload& payload,
                                              StoredMessageDirection direction,
+                                             StoredMessageState state,
                                              const ByteVector& signerPublicKeyBlob,
                                              CryptoSigner& signer,
                                              const ByteVector& localPublicKeyBlob,
@@ -476,6 +503,7 @@ bool ConversationStore::AppendPrivateMessage(const std::string& rootDir,
         record.signatureHex = BytesToHex(payload.signature);
         record.signerPublicKeyHex = BytesToHex(signerPublicKeyBlob);
         record.storedAtUtc = CurrentUtcIso8601();
+        record.state = StoredMessageStateToString(state);
         record.prevHashHex = prevHash;
         record.recordHashHex = BytesToHex(Sha256(BuildStoredRecordHashData(record)));
 
@@ -566,6 +594,7 @@ bool ConversationStore::LoadConversation(const std::string& rootDir,
             msg.toNodeId = record->toNodeId;
             msg.text = *text;
             msg.storedAtUtc = record->storedAtUtc;
+            msg.state = StoredMessageStateFromString(record->state);
             outMessages.push_back(std::move(msg));
         }
         return true;
@@ -756,6 +785,94 @@ bool ConversationStore::HasMessageId(const std::string& rootDir,
         }
     }
     return true;
+}
+
+bool ConversationStore::UpdateMessageState(const std::string& rootDir,
+                                   const NodeId& localNodeId,
+                                   const NodeId& peerNodeId,
+                                   MessageId messageId,
+                                   StoredMessageState newState,
+                                   CryptoSigner& signer,
+                                   const ByteVector& localPublicKeyBlob,
+                                   std::string* error) {
+    try {
+        fs::path dir = fs::path(rootDir) / localNodeId;
+        fs::path convoPath = dir / (peerNodeId + ".json");
+        fs::path manifestPath = dir / (peerNodeId + ".manifest.json");
+        if (!fs::exists(convoPath)) return true;
+        if (!fs::exists(manifestPath)) {
+            if (error) *error = "Manifest missing";
+            return false;
+        }
+        if (!VerifyConversationFileInternal(convoPath, manifestPath, signer, error)) return false;
+
+        std::ifstream in(convoPath);
+        if (!in) {
+            if (error) *error = "Failed to open conversation file";
+            return false;
+        }
+
+        std::vector<StoredRecord> records;
+        std::string line;
+        bool found = false;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            auto record = ParseRecordJson(line);
+            if (!record) {
+                if (error) *error = "Conversation JSON parse failed";
+                return false;
+            }
+            if (record->messageId == messageId) {
+                record->state = StoredMessageStateToString(newState);
+                found = true;
+            }
+            records.push_back(std::move(*record));
+        }
+        if (!found) return true;
+
+        std::string prevHash;
+        for (auto& record : records) {
+            record.prevHashHex = prevHash;
+            record.recordHashHex = BytesToHex(Sha256(BuildStoredRecordHashData(record)));
+            prevHash = record.recordHashHex;
+        }
+
+        {
+            std::ofstream out(convoPath, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                if (error) *error = "Failed to rewrite conversation file";
+                return false;
+            }
+            for (const auto& record : records) out << SerializeRecordJson(record) << "\n";
+        }
+
+        ManifestRecord manifest{};
+        manifest.peerNodeId = peerNodeId;
+        manifest.messageCount = records.size();
+        manifest.latestRecordHashHex = prevHash;
+        manifest.updatedAtUtc = CurrentUtcIso8601();
+        manifest.localPublicKeyHex = BytesToHex(localPublicKeyBlob);
+
+        ByteVector manifestSig;
+        if (!signer.Sign(BuildManifestSignedData(manifest), manifestSig)) {
+            if (error) *error = "Failed to sign manifest";
+            return false;
+        }
+        manifest.signatureHex = BytesToHex(manifestSig);
+
+        {
+            std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                if (error) *error = "Failed to write manifest";
+                return false;
+            }
+            out << SerializeManifestJson(manifest);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        if (error) *error = ex.what();
+        return false;
+    }
 }
 
 } // namespace p2p

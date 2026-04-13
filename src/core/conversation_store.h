@@ -14,6 +14,15 @@ enum class StoredMessageDirection {
     Outgoing
 };
 
+enum class StoredMessageState {
+    Created,
+    Queued,
+    Sent,
+    Relayed,
+    Delivered,
+    Failed
+};
+
 struct StoredConversationMessage {
     StoredMessageDirection direction = StoredMessageDirection::Incoming;
     std::uint64_t messageId = 0;
@@ -23,6 +32,7 @@ struct StoredConversationMessage {
     NodeId toNodeId;
     std::string text;
     std::string storedAtUtc;
+    StoredMessageState state = StoredMessageState::Created;
 };
 
 
@@ -38,6 +48,7 @@ public:
                                      const NodeId& peerNodeId,
                                      const PrivateMessagePayload& payload,
                                      StoredMessageDirection direction,
+                                     StoredMessageState state,
                                      const ByteVector& signerPublicKeyBlob,
                                      CryptoSigner& signer,
                                      const ByteVector& localPublicKeyBlob,
@@ -87,6 +98,15 @@ public:
                              CryptoSigner& signer,
                              bool* exists,
                              std::string* error = nullptr);
+
+    static bool UpdateMessageState(const std::string& rootDir,
+                                   const NodeId& localNodeId,
+                                   const NodeId& peerNodeId,
+                                   MessageId messageId,
+                                   StoredMessageState newState,
+                                   CryptoSigner& signer,
+                                   const ByteVector& localPublicKeyBlob,
+                                   std::string* error = nullptr);
 };
 
 } // namespace p2p
