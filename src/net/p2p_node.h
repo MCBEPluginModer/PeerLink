@@ -1,0 +1,175 @@
+#pragma once
+#include "core/conversation_store.h"
+#include "core/types.h"
+#include "crypto/crypto_signer.h"
+#include "net/known_nodes.h"
+#include "net/peer_manager.h"
+#include "net/router.h"
+
+namespace p2p {
+
+class PeerConnection;
+
+class P2PNode {
+public:
+    P2PNode(std::string nickname, std::uint16_t listenPort);
+    ~P2PNode();
+
+    bool Start();
+    void Stop();
+
+    bool ConnectToPeer(const std::string& ip, std::uint16_t port);
+
+    void BroadcastChat(const std::string& text);
+    void SendInvite(const NodeId& targetNodeId);
+    void AcceptInvite(const NodeId& fromNodeId);
+    void RejectInvite(const NodeId& fromNodeId, const std::string& reason = "rejected");
+    void SendPrivateMessage(const NodeId& targetNodeId, const std::string& text);
+    bool OpenPrivateChat(const NodeId& peerNodeId, const std::string& peerNickname = "");
+    bool DeleteConversationHistory(const NodeId& peerNodeId);
+    bool IsPeerConnected(const NodeId& peerNodeId) const;
+
+    void PrintKnownNodes() const;
+    void PrintInvites() const;
+    void PrintSessions() const;
+    void PrintInfo() const;
+    std::vector<DisplayUser> GetDisplayUsers() const;
+
+    void OnPacket(const std::shared_ptr<PeerConnection>& peer, PacketType type, PacketId packetId, const ByteVector& payload);
+    void OnPeerDisconnected(SOCKET socket);
+
+private:
+    bool InitWinSock();
+    void CleanupWinSock();
+
+    void AcceptLoop();
+    void DiscoveryLoop();
+    void UdpRecvLoop();
+
+    void SendHello(const std::shared_ptr<PeerConnection>& peer);
+    void SendHelloAck(const std::shared_ptr<PeerConnection>& peer);
+    void SendPeerList(const std::shared_ptr<PeerConnection>& peer);
+    void BroadcastPeerListToAll();
+    void SendPong(const std::shared_ptr<PeerConnection>& peer);
+
+    void HandleHello(const std::shared_ptr<PeerConnection>& peer, const ByteVector& payload);
+    void HandleHelloAck(const std::shared_ptr<PeerConnection>& peer, const ByteVector& payload);
+    void HandleChat(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandlePeerList(const ByteVector& payload);
+    void HandleInviteRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleInviteAccept(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleInviteReject(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleMessageAck(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleConnectRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleUdpPunchRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleRelayPrivateMessage(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleRelayMessageAck(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleHistorySyncRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandleHistorySyncResponse(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+
+    bool FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& peer, const HelloPayload& hello);
+    void BroadcastRaw(const ByteVector& packet, const NodeId& excludeNodeId = "");
+    void TryAutoConnectKnownNodes();
+    bool ShouldAttemptAutoConnect(const KnownNode& node);
+    void MarkConnectAttempt(const NodeId& nodeId);
+    bool PreferIncomingFor(const NodeId& remoteNodeId) const;
+    void SafeClosePeer(const std::shared_ptr<PeerConnection>& peer);
+
+    std::optional<PendingInvite> FindIncomingInviteByFromNodeId(const NodeId& fromNodeId) const;
+    std::optional<SessionId> FindSessionByPeer(const NodeId& peerNodeId) const;
+
+    ByteVector BuildInviteRequestSignedData(const InviteRequestPayload& p) const;
+    ByteVector BuildInviteAcceptSignedData(const InviteAcceptPayload& p) const;
+    ByteVector BuildInviteRejectSignedData(const InviteRejectPayload& p) const;
+    ByteVector BuildPrivateMessageSignedData(const PrivateMessagePayload& p) const;
+    ByteVector BuildMessageAckSignedData(const MessageAckPayload& p) const;
+    ByteVector BuildConnectRequestSignedData(const ConnectRequestPayload& p) const;
+    ByteVector BuildUdpPunchRequestSignedData(const UdpPunchRequestPayload& p) const;
+    ByteVector BuildHistorySyncRequestSignedData(const HistorySyncRequestPayload& p) const;
+    ByteVector BuildHistorySyncResponseSignedData(const HistorySyncResponsePayload& p) const;
+    void RequestReverseConnect(const KnownNode& target);
+    void RequestUdpHolePunch(const KnownNode& target);
+    bool TryConnectToKnownNode(const KnownNode& node);
+    void SendUdpProbeToKnownNodes();
+    void SendUdpProbeToEndpoint(const std::string& ip, std::uint16_t port);
+    void SendUdpPunchBurst(const KnownNode& node, const std::string& reason);
+    void HandleUdpDatagram(const std::string& ip, std::uint16_t port, const ByteVector& data);
+    void AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, const ByteVector& signerPublicKeyBlob);
+    bool RelayPrivateMessageToNetwork(const PrivateMessagePayload& payload);
+    bool RelayMessageAckToNetwork(const MessageAckPayload& payload);
+    void QueueRelayMessage(const RelayPrivateMessagePayload& payload);
+    void QueueRelayAck(const RelayMessageAckPayload& payload);
+    void FlushRelayQueueForTarget(const NodeId& targetNodeId);
+    void FlushRelayAckQueueForTarget(const NodeId& targetNodeId);
+    void RemoveQueuedRelayMessageByMessageId(const NodeId& targetNodeId, MessageId messageId);
+    void RemoveQueuedRelayAckByMessageId(const NodeId& targetNodeId, MessageId messageId);
+    void SendDeliveryAck(const PrivateMessagePayload& message, PacketId ackedRelayPacketId);
+    void EnsureSessionForPeer(const NodeId& peerNodeId, const std::string& peerNickname, SessionId sessionId);
+    void RequestHistorySync(const NodeId& peerNodeId);
+    void RetryRelayQueues();
+    bool SaveRelaySpoolToDisk() const;
+    void LoadRelaySpoolFromDisk();
+    void LoadBootstrapNodes();
+    void TryConnectBootstrapNodes();
+    void PrintStoredConversation(const NodeId& peerNodeId, const std::string& peerNicknameHint = "") const;
+    bool LoadOrCreateLocalIdentity();
+    void RestorePrivateSessionsFromHistory();
+
+private:
+    LocalNodeInfo local_;
+    SOCKET listenSocket_ = INVALID_SOCKET;
+    SOCKET udpSocket_ = INVALID_SOCKET;
+    std::atomic<bool> running_{false};
+    bool winsockInitialized_ = false;
+
+    std::thread acceptThread_;
+    std::thread discoveryThread_;
+    std::thread udpThread_;
+
+    PeerManager peerManager_;
+    Router router_;
+    KnownNodeTable knownNodes_;
+    CryptoSigner signer_;
+
+    mutable std::mutex publicKeysMutex_;
+    std::unordered_map<NodeId, ByteVector> publicKeys_;
+    ByteVector localPublicKeyBlob_;
+    std::string historyRootDir_ = "history";
+    std::string relaySpoolRootDir_ = "relay_spool";
+    std::string bootstrapConfigPath_ = "bootstrap_nodes.txt";
+
+    mutable std::mutex observedEndpointMutex_;
+    std::string localObservedIp_;
+    std::uint16_t localObservedPort_ = 0;
+    std::string localObservedUdpIp_;
+    std::uint16_t localObservedUdpPort_ = 0;
+
+    mutable std::mutex pendingMutex_;
+    std::unordered_map<SOCKET, std::shared_ptr<PeerConnection>> pendingPeers_;
+
+    mutable std::mutex connectAttemptsMutex_;
+    std::unordered_map<NodeId, std::chrono::steady_clock::time_point> lastConnectAttempt_;
+    mutable std::mutex bootstrapMutex_;
+    std::vector<BootstrapEndpoint> bootstrapNodes_;
+
+    mutable std::mutex invitesMutex_;
+    std::unordered_map<InviteId, PendingInvite> incomingInvites_;
+    std::unordered_map<InviteId, PendingInvite> outgoingInvites_;
+
+    mutable std::mutex sessionsMutex_;
+    std::unordered_map<SessionId, PrivateSession> sessionsById_;
+    std::unordered_map<NodeId, SessionId> sessionByPeer_;
+
+    mutable std::mutex relayMutex_;
+    std::unordered_map<NodeId, std::deque<QueuedRelayMessage>> relayQueuesByTarget_;
+    std::unordered_map<NodeId, std::deque<QueuedRelayAck>> relayAckQueuesByTarget_;
+    std::unordered_set<PacketId> deliveredRelayPackets_;
+    std::unordered_set<PacketId> deliveredRelayAckPackets_;
+
+    mutable std::mutex ackMutex_;
+    std::unordered_set<MessageId> seenMessageAcks_;
+    std::unordered_set<MessageId> deliveredOutgoingMessageIds_;
+};
+
+} // namespace p2p

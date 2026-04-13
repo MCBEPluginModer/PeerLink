@@ -1,0 +1,9 @@
+{
+    recheck = false,
+    options = {
+        mode = "release"
+    },
+    mtimes = {
+        ["xmake.lua"] = 1776009680
+    }
+}

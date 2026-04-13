@@ -1,0 +1,30 @@
+# build
+build/
+.cache/
+xmake-build/
+xmake-repo/
+
+# runtime data
+profile/
+history/
+relay_spool/
+
+# vscode
+.vscode/
+
+# logs / temp
+*.log
+*.tmp
+
+# windows
+Thumbs.db
+.DS_Store
+
+# binaries
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.o
+*.lib
+*.dll
