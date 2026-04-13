@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
 
 namespace p2p {
 namespace fs = std::filesystem;
@@ -20,9 +21,11 @@ namespace {
 
 struct StoredRecord {
     std::uint64_t version = 1;
+    bool hasStateField = false;
     std::string direction;
     std::uint64_t messageId = 0;
     std::uint64_t sessionId = 0;
+    std::uint64_t sequenceNumber = 0;
     std::string fromNodeId;
     std::string fromNicknameHex;
     std::string toNodeId;
@@ -175,6 +178,7 @@ ByteVector BuildStoredRecordHashData(const StoredRecord& r) {
     utils::WriteString(out, r.direction);
     utils::WriteUint64(out, r.messageId);
     utils::WriteUint64(out, r.sessionId);
+    utils::WriteUint64(out, r.sequenceNumber);
     utils::WriteString(out, r.fromNodeId);
     utils::WriteString(out, r.fromNicknameHex);
     utils::WriteString(out, r.toNodeId);
@@ -182,7 +186,9 @@ ByteVector BuildStoredRecordHashData(const StoredRecord& r) {
     utils::WriteString(out, r.signatureHex);
     utils::WriteString(out, r.signerPublicKeyHex);
     utils::WriteString(out, r.storedAtUtc);
-    utils::WriteString(out, r.state);
+    if (r.hasStateField || r.version >= 2) {
+        utils::WriteString(out, r.state);
+    }
     utils::WriteString(out, r.prevHashHex);
     return out;
 }
@@ -205,6 +211,7 @@ std::string SerializeRecordJson(const StoredRecord& r) {
     oss << "\"direction\":\"" << JsonEscape(r.direction) << "\",";
     oss << "\"message_id\":" << r.messageId << ",";
     oss << "\"session_id\":" << r.sessionId << ",";
+    oss << "\"sequence_number\":" << r.sequenceNumber << ",";
     oss << "\"from_node_id\":\"" << JsonEscape(r.fromNodeId) << "\",";
     oss << "\"from_nickname_hex\":\"" << r.fromNicknameHex << "\",";
     oss << "\"to_node_id\":\"" << JsonEscape(r.toNodeId) << "\",";
@@ -263,6 +270,7 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     auto direction = ExtractJsonString(line, "direction");
     auto messageId = ExtractJsonUint64(line, "message_id");
     auto sessionId = ExtractJsonUint64(line, "session_id");
+    auto sequenceNumber = ExtractJsonUint64(line, "sequence_number");
     auto fromNodeId = ExtractJsonString(line, "from_node_id");
     auto fromNickHex = ExtractJsonString(line, "from_nickname_hex");
     auto toNodeId = ExtractJsonString(line, "to_node_id");
@@ -281,6 +289,7 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     r.direction = *direction;
     r.messageId = *messageId;
     r.sessionId = *sessionId;
+    r.sequenceNumber = sequenceNumber.value_or(0);
     r.fromNodeId = *fromNodeId;
     r.fromNicknameHex = *fromNickHex;
     r.toNodeId = *toNodeId;
@@ -289,6 +298,7 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     r.signerPublicKeyHex = *signerPubHex;
     r.storedAtUtc = *storedAt;
     r.state = state.value_or("created");
+    r.hasStateField = state.has_value();
     r.prevHashHex = *prevHash;
     r.recordHashHex = *recordHash;
     return r;
@@ -314,6 +324,37 @@ std::optional<ManifestRecord> ParseManifestJson(const std::string& line) {
     m.localPublicKeyHex = *localPubHex;
     m.signatureHex = *signatureHex;
     return m;
+}
+
+fs::path ConversationStatePath(const fs::path& dir, const NodeId& peerNodeId) {
+    return dir / (peerNodeId + ".state.json");
+}
+
+std::unordered_map<MessageId, StoredMessageState> LoadStateOverrides(const fs::path& path) {
+    std::unordered_map<MessageId, StoredMessageState> out;
+    std::ifstream in(path);
+    if (!in) return out;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        auto msgId = ExtractJsonUint64(line, "message_id");
+        auto state = ExtractJsonString(line, "state");
+        if (!msgId || !state) continue;
+        out[*msgId] = StoredMessageStateFromString(*state);
+    }
+    return out;
+}
+
+bool SaveStateOverrides(const fs::path& path, const std::unordered_map<MessageId, StoredMessageState>& states, std::string* error) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        if (error) *error = "Failed to write state file";
+        return false;
+    }
+    for (const auto& [messageId, state] : states) {
+        out << "{\"message_id\":" << messageId << ",\"state\":\"" << JsonEscape(StoredMessageStateToString(state)) << "\"}\n";
+    }
+    return true;
 }
 
 bool ReadLastNonEmptyLine(const fs::path& path, std::string& outLine) {
@@ -395,6 +436,7 @@ bool VerifyConversationFileInternal(const fs::path& convoPath,
         }
         payload.messageId = r.messageId;
         payload.sessionId = r.sessionId;
+        payload.sequenceNumber = r.sequenceNumber;
         payload.fromNodeId = r.fromNodeId;
         payload.fromNickname = *nick;
         payload.toNodeId = r.toNodeId;
@@ -404,6 +446,7 @@ bool VerifyConversationFileInternal(const fs::path& convoPath,
         ByteVector signData;
         utils::WriteUint64(signData, payload.messageId);
         utils::WriteUint64(signData, payload.sessionId);
+        utils::WriteUint64(signData, payload.sequenceNumber);
         utils::WriteString(signData, payload.fromNodeId);
         utils::WriteString(signData, payload.fromNickname);
         utils::WriteString(signData, payload.toNodeId);
@@ -456,6 +499,7 @@ bool ConversationStore::AppendPrivateMessage(const std::string& rootDir,
 
         fs::path convoPath = dir / (peerNodeId + ".json");
         fs::path manifestPath = dir / (peerNodeId + ".manifest.json");
+        fs::path statePath = ConversationStatePath(dir, peerNodeId);
 
         std::string prevHash;
         std::uint64_t nextCount = 1;
@@ -496,6 +540,9 @@ bool ConversationStore::AppendPrivateMessage(const std::string& rootDir,
         record.direction = (direction == StoredMessageDirection::Outgoing) ? "out" : "in";
         record.messageId = payload.messageId;
         record.sessionId = payload.sessionId;
+        record.version = 2;
+        record.hasStateField = true;
+        record.sequenceNumber = payload.sequenceNumber;
         record.fromNodeId = payload.fromNodeId;
         record.fromNicknameHex = StringToHex(payload.fromNickname);
         record.toNodeId = payload.toNodeId;
@@ -564,6 +611,8 @@ bool ConversationStore::LoadConversation(const std::string& rootDir,
         }
         if (!VerifyConversationFileInternal(convoPath, manifestPath, signer, error)) return false;
 
+        auto stateOverrides = LoadStateOverrides(ConversationStatePath(dir, peerNodeId));
+
         std::ifstream in(convoPath);
         if (!in) {
             if (error) *error = "Failed to open conversation file";
@@ -589,12 +638,15 @@ bool ConversationStore::LoadConversation(const std::string& rootDir,
             msg.direction = (record->direction == "out") ? StoredMessageDirection::Outgoing : StoredMessageDirection::Incoming;
             msg.messageId = record->messageId;
             msg.sessionId = record->sessionId;
+            msg.sequenceNumber = record->sequenceNumber;
             msg.fromNodeId = record->fromNodeId;
             msg.fromNickname = *nick;
             msg.toNodeId = record->toNodeId;
             msg.text = *text;
             msg.storedAtUtc = record->storedAtUtc;
             msg.state = StoredMessageStateFromString(record->state);
+            auto overrideIt = stateOverrides.find(msg.messageId);
+            if (overrideIt != stateOverrides.end()) msg.state = overrideIt->second;
             outMessages.push_back(std::move(msg));
         }
         return true;
@@ -632,6 +684,7 @@ bool ConversationStore::EnumerateLatestSessions(const std::string& rootDir,
             const auto path = entry.path();
             if (path.extension() != ".json") continue;
             if (path.filename().string().find(".manifest.json") != std::string::npos) continue;
+            if (path.filename().string().find(".state.json") != std::string::npos) continue;
 
             const auto peerNodeId = path.stem().string();
             std::vector<StoredConversationMessage> messages;
@@ -660,11 +713,14 @@ bool ConversationStore::DeleteConversation(const std::string& rootDir,
         fs::path dir = fs::path(rootDir) / localNodeId;
         fs::path convoPath = dir / (peerNodeId + ".json");
         fs::path manifestPath = dir / (peerNodeId + ".manifest.json");
+        fs::path statePath = ConversationStatePath(dir, peerNodeId);
         std::error_code ec;
         if (fs::exists(convoPath)) fs::remove(convoPath, ec);
         if (ec) { if (error) *error = "Failed to remove conversation file"; return false; }
         if (fs::exists(manifestPath)) fs::remove(manifestPath, ec);
         if (ec) { if (error) *error = "Failed to remove manifest file"; return false; }
+        if (fs::exists(statePath)) fs::remove(statePath, ec);
+        if (ec) { if (error) *error = "Failed to remove state file"; return false; }
         return true;
     } catch (const std::exception& ex) {
         if (error) *error = ex.what();
@@ -686,6 +742,7 @@ bool ConversationStore::VerifyAllForLocalNode(const std::string& rootDir,
             const auto path = entry.path();
             if (path.extension() != ".json") continue;
             if (path.filename().string().find(".manifest.json") != std::string::npos) continue;
+            if (path.filename().string().find(".state.json") != std::string::npos) continue;
 
             fs::path manifestPath = path.parent_path() / (path.stem().string() + ".manifest.json");
             if (!fs::exists(manifestPath)) {
@@ -753,6 +810,7 @@ bool ConversationStore::LoadSignedOutgoingMessagesAfter(const std::string& rootD
             StoredSignedPrivateMessage msg{};
             msg.payload.messageId = record->messageId;
             msg.payload.sessionId = record->sessionId;
+            msg.payload.sequenceNumber = record->sequenceNumber;
             msg.payload.fromNodeId = record->fromNodeId;
             msg.payload.fromNickname = *nick;
             msg.payload.toNodeId = record->toNodeId;
@@ -798,77 +856,11 @@ bool ConversationStore::UpdateMessageState(const std::string& rootDir,
     try {
         fs::path dir = fs::path(rootDir) / localNodeId;
         fs::path convoPath = dir / (peerNodeId + ".json");
-        fs::path manifestPath = dir / (peerNodeId + ".manifest.json");
         if (!fs::exists(convoPath)) return true;
-        if (!fs::exists(manifestPath)) {
-            if (error) *error = "Manifest missing";
-            return false;
-        }
-        if (!VerifyConversationFileInternal(convoPath, manifestPath, signer, error)) return false;
 
-        std::ifstream in(convoPath);
-        if (!in) {
-            if (error) *error = "Failed to open conversation file";
-            return false;
-        }
-
-        std::vector<StoredRecord> records;
-        std::string line;
-        bool found = false;
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            auto record = ParseRecordJson(line);
-            if (!record) {
-                if (error) *error = "Conversation JSON parse failed";
-                return false;
-            }
-            if (record->messageId == messageId) {
-                record->state = StoredMessageStateToString(newState);
-                found = true;
-            }
-            records.push_back(std::move(*record));
-        }
-        if (!found) return true;
-
-        std::string prevHash;
-        for (auto& record : records) {
-            record.prevHashHex = prevHash;
-            record.recordHashHex = BytesToHex(Sha256(BuildStoredRecordHashData(record)));
-            prevHash = record.recordHashHex;
-        }
-
-        {
-            std::ofstream out(convoPath, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                if (error) *error = "Failed to rewrite conversation file";
-                return false;
-            }
-            for (const auto& record : records) out << SerializeRecordJson(record) << "\n";
-        }
-
-        ManifestRecord manifest{};
-        manifest.peerNodeId = peerNodeId;
-        manifest.messageCount = records.size();
-        manifest.latestRecordHashHex = prevHash;
-        manifest.updatedAtUtc = CurrentUtcIso8601();
-        manifest.localPublicKeyHex = BytesToHex(localPublicKeyBlob);
-
-        ByteVector manifestSig;
-        if (!signer.Sign(BuildManifestSignedData(manifest), manifestSig)) {
-            if (error) *error = "Failed to sign manifest";
-            return false;
-        }
-        manifest.signatureHex = BytesToHex(manifestSig);
-
-        {
-            std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                if (error) *error = "Failed to write manifest";
-                return false;
-            }
-            out << SerializeManifestJson(manifest);
-        }
-        return true;
+        auto states = LoadStateOverrides(ConversationStatePath(dir, peerNodeId));
+        states[messageId] = newState;
+        return SaveStateOverrides(ConversationStatePath(dir, peerNodeId), states, error);
     } catch (const std::exception& ex) {
         if (error) *error = ex.what();
         return false;

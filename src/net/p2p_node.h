@@ -6,6 +6,8 @@
 #include "net/peer_manager.h"
 #include "net/router.h"
 
+#include <map>
+
 namespace p2p {
 
 class PeerConnection;
@@ -50,7 +52,11 @@ private:
     void SendHelloAck(const std::shared_ptr<PeerConnection>& peer);
     void SendPeerList(const std::shared_ptr<PeerConnection>& peer);
     void BroadcastPeerListToAll();
+    void SendPing(const std::shared_ptr<PeerConnection>& peer);
     void SendPong(const std::shared_ptr<PeerConnection>& peer);
+    void RunHeartbeatChecks();
+    void CleanupExpiredRelayQueues();
+    bool CheckIncomingRateLimit(const std::shared_ptr<PeerConnection>& peer, PacketType type);
 
     void HandleHello(const std::shared_ptr<PeerConnection>& peer, const ByteVector& payload);
     void HandleHelloAck(const std::shared_ptr<PeerConnection>& peer, const ByteVector& payload);
@@ -73,6 +79,8 @@ private:
     void TryAutoConnectKnownNodes();
     bool ShouldAttemptAutoConnect(const KnownNode& node);
     void MarkConnectAttempt(const NodeId& nodeId);
+    void NoteReconnectFailure(const NodeId& nodeId);
+    void ResetReconnectState(const NodeId& nodeId);
     bool PreferIncomingFor(const NodeId& remoteNodeId) const;
     void SafeClosePeer(const std::shared_ptr<PeerConnection>& peer);
 
@@ -98,6 +106,10 @@ private:
     void AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, StoredMessageState state, const ByteVector& signerPublicKeyBlob);
     bool HasStoredMessageForPeer(const NodeId& peerNodeId, MessageId messageId) const;
     bool UpdateStoredMessageState(const NodeId& peerNodeId, MessageId messageId, StoredMessageState newState);
+    std::uint64_t GetNextOutgoingSequence(const NodeId& peerNodeId);
+    std::uint64_t GetExpectedIncomingSequence(const NodeId& peerNodeId);
+    void DeliverOrderedIncomingPrivateMessage(const PrivateMessagePayload& payload, const ByteVector& signerPublicKeyBlob, PacketId ackedRelayPacketId, bool logMessage);
+    void BufferOrDeliverIncomingPrivateMessage(const PrivateMessagePayload& payload, const ByteVector& signerPublicKeyBlob, PacketId ackedRelayPacketId, bool logMessage);
     bool RelayPrivateMessageToNetwork(const PrivateMessagePayload& payload);
     bool RelayMessageAckToNetwork(const MessageAckPayload& payload);
     void QueueRelayMessage(const RelayPrivateMessagePayload& payload);
@@ -151,6 +163,14 @@ private:
     std::unordered_map<SOCKET, std::shared_ptr<PeerConnection>> pendingPeers_;
 
     mutable std::mutex connectAttemptsMutex_;
+
+    struct ReconnectState {
+        std::uint32_t failureCount = 0;
+        std::chrono::steady_clock::time_point nextAttempt{};
+    };
+
+    mutable std::mutex reconnectMutex_;
+    std::unordered_map<NodeId, ReconnectState> reconnectStates_;
     std::unordered_map<NodeId, std::chrono::steady_clock::time_point> lastConnectAttempt_;
     mutable std::mutex bootstrapMutex_;
     std::vector<BootstrapEndpoint> bootstrapNodes_;
@@ -169,9 +189,41 @@ private:
     std::unordered_set<PacketId> deliveredRelayPackets_;
     std::unordered_set<PacketId> deliveredRelayAckPackets_;
 
+    struct BufferedIncomingPrivateMessage {
+        PrivateMessagePayload payload;
+        ByteVector signerPublicKeyBlob;
+        PacketId ackedRelayPacketId = 0;
+        bool logMessage = false;
+    };
+
+    mutable std::mutex sequenceMutex_;
+    std::unordered_map<NodeId, std::uint64_t> nextOutgoingSequenceByPeer_;
+    std::unordered_map<NodeId, std::uint64_t> expectedIncomingSequenceByPeer_;
+    std::unordered_map<NodeId, std::map<std::uint64_t, BufferedIncomingPrivateMessage>> reorderBufferByPeer_;
+
     mutable std::mutex ackMutex_;
     std::unordered_set<MessageId> seenMessageAcks_;
     std::unordered_set<MessageId> deliveredOutgoingMessageIds_;
+
+    struct RateLimiterState {
+        double generalTokens = 80.0;
+        double messageTokens = 24.0;
+        std::chrono::steady_clock::time_point lastRefill = std::chrono::steady_clock::now();
+        std::uint32_t violations = 0;
+    };
+
+    mutable std::mutex rateLimitMutex_;
+    std::unordered_map<SOCKET, RateLimiterState> rateLimitBySocket_;
+
+    const std::chrono::seconds heartbeatInterval_{5};
+    const std::chrono::seconds heartbeatTimeout_{30};
+    const std::chrono::hours relayMessageTtl_{24};
+    const std::chrono::hours relayAckTtl_{6};
+    const double generalRatePerSecond_{16.0};
+    const double generalBurst_{80.0};
+    const double messageRatePerSecond_{6.0};
+    const double messageBurst_{24.0};
+    const std::uint32_t maxRateViolations_{20};
 };
 
 } // namespace p2p

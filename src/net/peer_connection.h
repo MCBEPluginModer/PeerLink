@@ -36,6 +36,11 @@ public:
 
     bool TrySetActive();
     bool TryBeginClosing();
+    bool IsActive() const;
+
+    void MarkReceivedActivity();
+    bool ShouldSendPing(std::chrono::steady_clock::time_point now, std::chrono::seconds interval);
+    bool IsHeartbeatTimedOut(std::chrono::steady_clock::time_point now, std::chrono::seconds timeout) const;
 
 private:
     void RecvLoop();
@@ -62,6 +67,9 @@ private:
 
     std::thread recvThread_;
     std::thread sendThread_;
+
+    std::atomic<std::uint64_t> lastReceivedActivityMs_{0};
+    std::atomic<std::uint64_t> lastPingSentMs_{0};
 };
 
 } // namespace p2p

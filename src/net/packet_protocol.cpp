@@ -145,6 +145,7 @@ std::vector<std::uint8_t> SerializePrivateMessage(const PrivateMessagePayload& p
     ByteVector out;
     utils::WriteUint64(out, payload.messageId);
     utils::WriteUint64(out, payload.sessionId);
+    utils::WriteUint64(out, payload.sequenceNumber);
     utils::WriteString(out, payload.fromNodeId);
     utils::WriteString(out, payload.fromNickname);
     utils::WriteString(out, payload.toNodeId);
@@ -157,6 +158,7 @@ bool DeserializePrivateMessage(const ByteVector& data, PrivateMessagePayload& pa
     std::size_t offset = 0;
     if (!utils::ReadUint64(data, offset, payload.messageId)) return false;
     if (!utils::ReadUint64(data, offset, payload.sessionId)) return false;
+    if (!utils::ReadUint64(data, offset, payload.sequenceNumber)) return false;
     if (!utils::ReadString(data, offset, payload.fromNodeId)) return false;
     if (!utils::ReadString(data, offset, payload.fromNickname)) return false;
     if (!utils::ReadString(data, offset, payload.toNodeId)) return false;
@@ -311,6 +313,7 @@ bool DeserializeHistorySyncResponse(const ByteVector& data, HistorySyncResponseP
 
 std::vector<std::uint8_t> MakePacket(PacketType type, PacketId packetId, const ByteVector& payload) {
     PacketHeader header{};
+    header.version = kProtocolVersion;
     header.type = static_cast<std::uint16_t>(type);
     header.size = static_cast<std::uint32_t>(payload.size());
     header.packetId = packetId;
@@ -323,6 +326,8 @@ std::vector<std::uint8_t> MakePacket(PacketType type, PacketId packetId, const B
 
 bool ReadPacket(SOCKET s, PacketHeader& header, ByteVector& payload) {
     if (!utils::RecvAll(s, reinterpret_cast<std::uint8_t*>(&header), sizeof(PacketHeader))) return false;
+    if (header.version != kProtocolVersion) return false;
+    if (header.size > kMaxPacketSize) return false;
     payload.clear();
     if (header.size > 0) {
         payload.resize(header.size);

@@ -26,6 +26,9 @@ using SessionId = std::uint64_t;
 using MessageId = std::uint64_t;
 using ByteVector = std::vector<std::uint8_t>;
 
+constexpr std::uint16_t kProtocolVersion = 2;
+constexpr std::uint32_t kMaxPacketSize = 1024u * 1024u;
+
 enum class PacketType : std::uint16_t {
     Hello = 1,
     HelloAck = 2,
@@ -48,6 +51,7 @@ enum class PacketType : std::uint16_t {
 
 #pragma pack(push, 1)
 struct PacketHeader {
+    std::uint16_t version = kProtocolVersion;
     std::uint16_t type = 0;
     std::uint32_t size = 0;
     std::uint64_t packetId = 0;
@@ -123,6 +127,7 @@ struct InviteRejectPayload {
 struct PrivateMessagePayload {
     MessageId messageId = 0;
     SessionId sessionId = 0;
+    std::uint64_t sequenceNumber = 0;
     NodeId fromNodeId;
     std::string fromNickname;
     NodeId toNodeId;
@@ -233,6 +238,7 @@ struct DisplayUser {
     NodeId nodeId;
     std::string nickname;
     bool online = false;
+    std::uint64_t lastSeenSecondsAgo = 0;
 };
 
 struct BootstrapEndpoint {

@@ -27,6 +27,7 @@ struct StoredConversationMessage {
     StoredMessageDirection direction = StoredMessageDirection::Incoming;
     std::uint64_t messageId = 0;
     std::uint64_t sessionId = 0;
+    std::uint64_t sequenceNumber = 0;
     NodeId fromNodeId;
     std::string fromNickname;
     NodeId toNodeId;

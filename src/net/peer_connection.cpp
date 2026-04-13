@@ -6,7 +6,11 @@
 namespace p2p {
 
 PeerConnection::PeerConnection(P2PNode* owner, SOCKET socket, std::string remoteIp, std::uint16_t remotePort, bool incoming)
-    : owner_(owner), socket_(socket), remoteIp_(std::move(remoteIp)), remotePort_(remotePort), incoming_(incoming) {}
+    : owner_(owner), socket_(socket), remoteIp_(std::move(remoteIp)), remotePort_(remotePort), incoming_(incoming) {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    lastReceivedActivityMs_.store(nowMs, std::memory_order_release);
+    lastPingSentMs_.store(nowMs, std::memory_order_release);
+}
 
 PeerConnection::~PeerConnection() {
     RequestClose();
@@ -83,6 +87,30 @@ std::uint16_t PeerConnection::GetAdvertisedListenPort() const { return advertise
 bool PeerConnection::TrySetActive() {
     PeerState expected = PeerState::PendingHandshake;
     return state_.compare_exchange_strong(expected, PeerState::Active);
+}
+
+bool PeerConnection::IsActive() const { return state_.load(std::memory_order_acquire) == PeerState::Active; }
+
+void PeerConnection::MarkReceivedActivity() {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    lastReceivedActivityMs_.store(nowMs, std::memory_order_release);
+}
+
+bool PeerConnection::ShouldSendPing(std::chrono::steady_clock::time_point now, std::chrono::seconds interval) {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    auto prev = lastPingSentMs_.load(std::memory_order_acquire);
+    const auto intervalMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(interval).count());
+    while (true) {
+        if (nowMs < prev + intervalMs) return false;
+        if (lastPingSentMs_.compare_exchange_weak(prev, nowMs)) return true;
+    }
+}
+
+bool PeerConnection::IsHeartbeatTimedOut(std::chrono::steady_clock::time_point now, std::chrono::seconds timeout) const {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    const auto lastRx = lastReceivedActivityMs_.load(std::memory_order_acquire);
+    const auto timeoutMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
+    return nowMs > lastRx + timeoutMs;
 }
 
 bool PeerConnection::TryBeginClosing() {

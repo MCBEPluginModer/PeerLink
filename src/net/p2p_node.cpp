@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cctype>
+#include <ctime>
 
 namespace p2p {
 
@@ -302,6 +303,8 @@ void P2PNode::DiscoveryLoop() {
         std::this_thread::sleep_for(2s);
         if (!running_) break;
         BroadcastPeerListToAll();
+        RunHeartbeatChecks();
+        CleanupExpiredRelayQueues();
         SendUdpProbeToKnownNodes();
         TryAutoConnectKnownNodes();
         TryConnectBootstrapNodes();
@@ -348,12 +351,112 @@ void P2PNode::BroadcastPeerListToAll() {
     for (auto& p : peerManager_.GetAllPeers()) SendPeerList(p);
 }
 
+void P2PNode::SendPing(const std::shared_ptr<PeerConnection>& peer) {
+    if (!peer || !peer->IsAlive()) return;
+    auto packet = protocol::MakePacket(PacketType::Ping, utils::GeneratePacketId(), {});
+    peer->EnqueuePacket(std::move(packet));
+}
+
 void P2PNode::SendPong(const std::shared_ptr<PeerConnection>& peer) {
     auto packet = protocol::MakePacket(PacketType::Pong, utils::GeneratePacketId(), {});
     peer->EnqueuePacket(std::move(packet));
 }
 
+void P2PNode::RunHeartbeatChecks() {
+    auto now = std::chrono::steady_clock::now();
+    for (const auto& peer : peerManager_.GetAllPeers()) {
+        if (!peer || !peer->IsAlive() || !peer->IsActive()) continue;
+        if (peer->IsHeartbeatTimedOut(now, heartbeatTimeout_)) {
+            const auto name = peer->GetRemoteNickname().empty() ? peer->GetRemoteNodeId() : peer->GetRemoteNickname();
+            utils::LogSystem("Heartbeat timeout for peer: " + name);
+            SafeClosePeer(peer);
+            continue;
+        }
+        if (peer->ShouldSendPing(now, heartbeatInterval_)) {
+            SendPing(peer);
+        }
+    }
+}
+
+void P2PNode::CleanupExpiredRelayQueues() {
+    const auto now = std::chrono::system_clock::now();
+    bool mutated = false;
+    {
+        std::lock_guard<std::mutex> lock(relayMutex_);
+        for (auto it = relayQueuesByTarget_.begin(); it != relayQueuesByTarget_.end();) {
+            auto& q = it->second;
+            const auto before = q.size();
+            q.erase(std::remove_if(q.begin(), q.end(), [&](const QueuedRelayMessage& msg) {
+                return now - msg.queuedAt > relayMessageTtl_;
+            }), q.end());
+            mutated = mutated || (q.size() != before);
+            if (q.empty()) it = relayQueuesByTarget_.erase(it); else ++it;
+        }
+        for (auto it = relayAckQueuesByTarget_.begin(); it != relayAckQueuesByTarget_.end();) {
+            auto& q = it->second;
+            const auto before = q.size();
+            q.erase(std::remove_if(q.begin(), q.end(), [&](const QueuedRelayAck& msg) {
+                return now - msg.queuedAt > relayAckTtl_;
+            }), q.end());
+            mutated = mutated || (q.size() != before);
+            if (q.empty()) it = relayAckQueuesByTarget_.erase(it); else ++it;
+        }
+    }
+    if (mutated) {
+        SaveRelaySpoolToDisk();
+        utils::LogSystem("Expired relay queue entries were cleaned up");
+    }
+}
+
+bool P2PNode::CheckIncomingRateLimit(const std::shared_ptr<PeerConnection>& peer, PacketType type) {
+    if (!peer) return true;
+
+    const bool isMessageHeavy = (
+        type == PacketType::ChatMessage ||
+        type == PacketType::PrivateMessage ||
+        type == PacketType::RelayPrivateMessage ||
+        type == PacketType::HistorySyncResponse);
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(rateLimitMutex_);
+    auto& state = rateLimitBySocket_[peer->GetSocket()];
+    const auto elapsed = std::chrono::duration<double>(now - state.lastRefill).count();
+    state.lastRefill = now;
+
+    state.generalTokens = std::min(generalBurst_, state.generalTokens + elapsed * generalRatePerSecond_);
+    state.messageTokens = std::min(messageBurst_, state.messageTokens + elapsed * messageRatePerSecond_);
+
+    if (state.generalTokens < 1.0 || (isMessageHeavy && state.messageTokens < 1.0)) {
+        ++state.violations;
+        if (state.violations == 1 || state.violations % 5 == 0) {
+            const auto remote = peer->GetRemoteNickname().empty() ? peer->GetRemoteNodeId() : peer->GetRemoteNickname();
+            utils::LogError("Rate limit exceeded for peer: " + remote);
+        }
+        if (state.violations >= maxRateViolations_) {
+            utils::LogError("Closing peer due to repeated rate-limit violations");
+            SafeClosePeer(peer);
+        }
+        return false;
+    }
+
+    state.generalTokens -= 1.0;
+    if (isMessageHeavy) state.messageTokens -= 1.0;
+    if (state.violations > 0) --state.violations;
+    return true;
+}
+
 void P2PNode::OnPacket(const std::shared_ptr<PeerConnection>& peer, PacketType type, PacketId packetId, const ByteVector& payload) {
+    if (peer) {
+        peer->MarkReceivedActivity();
+        if (!CheckIncomingRateLimit(peer, type)) return;
+        const auto remoteId = peer->GetRemoteNodeId();
+        if (!remoteId.empty()) {
+            if (auto known = knownNodes_.FindByNodeId(remoteId)) {
+                known->lastSeen = std::chrono::steady_clock::now();
+                knownNodes_.Upsert(*known);
+            }
+        }
+    }
     switch (type) {
         case PacketType::Hello: HandleHello(peer, payload); break;
         case PacketType::HelloAck: HandleHelloAck(peer, payload); break;
@@ -418,6 +521,7 @@ bool P2PNode::FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& 
     known.lastSeen = std::chrono::steady_clock::now();
     const bool wasKnown = knownNodes_.Exists(hello.nodeId);
     knownNodes_.Upsert(known);
+    ResetReconnectState(hello.nodeId);
 
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -501,6 +605,7 @@ ByteVector P2PNode::BuildPrivateMessageSignedData(const PrivateMessagePayload& p
     ByteVector out;
     utils::WriteUint64(out, p.messageId);
     utils::WriteUint64(out, p.sessionId);
+    utils::WriteUint64(out, p.sequenceNumber);
     utils::WriteString(out, p.fromNodeId);
     utils::WriteString(out, p.fromNickname);
     utils::WriteString(out, p.toNodeId);
@@ -755,6 +860,7 @@ void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& 
     PrivateMessagePayload payload{};
     payload.messageId = GenerateMessageIdForNode(local_.nodeId);
     payload.sessionId = *sessionIdOpt;
+    payload.sequenceNumber = GetNextOutgoingSequence(targetNodeId);
     payload.fromNodeId = local_.nodeId;
     payload.fromNickname = local_.nickname;
     payload.toNodeId = targetNodeId;
@@ -803,15 +909,7 @@ void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, 
     }
 
     if (p.toNodeId != local_.nodeId) return;
-    if (HasStoredMessageForPeer(p.fromNodeId, p.messageId)) {
-        SendDeliveryAck(p, 0);
-        return;
-    }
-
-    EnsureSessionForPeer(p.fromNodeId, p.fromNickname, p.sessionId);
-    AppendStoredPrivateMessage(p, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
-    SendDeliveryAck(p, 0);
-    utils::LogPrivate(p.fromNickname, p.text);
+    BufferOrDeliverIncomingPrivateMessage(p, pub, 0, true);
 }
 
 void P2PNode::HandleMessageAck(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload) {
@@ -1082,12 +1180,9 @@ void P2PNode::HandleRelayPrivateMessage(const std::shared_ptr<PeerConnection>& p
         }
         if (inner.toNodeId != local_.nodeId) return;
 
-        if (router_.MarkSeen(inner.messageId) && !HasStoredMessageForPeer(inner.fromNodeId, inner.messageId)) {
-            EnsureSessionForPeer(inner.fromNodeId, inner.fromNickname, inner.sessionId);
-            AppendStoredPrivateMessage(inner, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
-            utils::LogPrivate(inner.fromNickname, inner.text);
+        if (router_.MarkSeen(inner.messageId)) {
+            BufferOrDeliverIncomingPrivateMessage(inner, pub, relay.relayPacketId, true);
         }
-        SendDeliveryAck(inner, relay.relayPacketId);
         return;
     }
 
@@ -1189,6 +1284,7 @@ bool P2PNode::SaveRelaySpoolToDisk() const {
                 out << "relay_from=" << msg.relayFromNodeId << "\n";
                 out << "payload_hex=" << BytesToHexLocal(msg.privateMessagePacket) << "\n";
                 out << "attempt_count=" << msg.attemptCount << "\n";
+                out << "queued_at_unix=" << static_cast<long long>(std::chrono::system_clock::to_time_t(msg.queuedAt)) << "\n";
             }
         }
         for (const auto& [target, q] : relayAckQueuesByTarget_) {
@@ -1202,6 +1298,7 @@ bool P2PNode::SaveRelaySpoolToDisk() const {
                 out << "relay_from=" << msg.relayFromNodeId << "\n";
                 out << "payload_hex=" << BytesToHexLocal(msg.ackPacket) << "\n";
                 out << "attempt_count=" << msg.attemptCount << "\n";
+                out << "queued_at_unix=" << static_cast<long long>(std::chrono::system_clock::to_time_t(msg.queuedAt)) << "\n";
             }
         }
         return true;
@@ -1226,6 +1323,7 @@ void P2PNode::LoadRelaySpoolFromDisk() {
             PacketId relayPacketId = 0;
             MessageId messageId = 0;
             std::uint32_t attemptCount = 0;
+            std::time_t queuedAtUnix = 0;
             while (std::getline(in, line)) {
                 auto pos = line.find('=');
                 if (pos == std::string::npos) continue;
@@ -1238,6 +1336,7 @@ void P2PNode::LoadRelaySpoolFromDisk() {
                 else if (k == "relay_from") relayFrom = v;
                 else if (k == "payload_hex") payloadHex = v;
                 else if (k == "attempt_count") attemptCount = static_cast<std::uint32_t>(std::stoul(v));
+                else if (k == "queued_at_unix") queuedAtUnix = static_cast<std::time_t>(std::stoll(v));
             }
             ByteVector payload;
             if (target.empty() || payloadHex.empty() || !HexToBytesLocal(payloadHex, payload)) continue;
@@ -1248,7 +1347,7 @@ void P2PNode::LoadRelaySpoolFromDisk() {
                 item.relayFromNodeId = relayFrom;
                 item.finalTargetNodeId = target;
                 item.privateMessagePacket = std::move(payload);
-                item.queuedAt = std::chrono::system_clock::now();
+                item.queuedAt = queuedAtUnix != 0 ? std::chrono::system_clock::from_time_t(queuedAtUnix) : std::chrono::system_clock::now();
                 item.attemptCount = attemptCount;
                 item.nextAttemptAt = std::chrono::steady_clock::now();
                 relayQueuesByTarget_[target].push_back(std::move(item));
@@ -1259,7 +1358,7 @@ void P2PNode::LoadRelaySpoolFromDisk() {
                 item.relayFromNodeId = relayFrom;
                 item.finalTargetNodeId = target;
                 item.ackPacket = std::move(payload);
-                item.queuedAt = std::chrono::system_clock::now();
+                item.queuedAt = queuedAtUnix != 0 ? std::chrono::system_clock::from_time_t(queuedAtUnix) : std::chrono::system_clock::now();
                 item.attemptCount = attemptCount;
                 item.nextAttemptAt = std::chrono::steady_clock::now();
                 relayAckQueuesByTarget_[target].push_back(std::move(item));
@@ -1336,9 +1435,16 @@ void P2PNode::HandleHistorySyncResponse(const std::shared_ptr<PeerConnection>& p
         if (!ConversationStore::HasMessageId(historyRootDir_, local_.nodeId, resp.responderNodeId, msg.messageId, signer_, &exists, &error)) continue;
         if (exists) continue;
         if (!signer_.Verify(BuildPrivateMessageSignedData(msg), msg.signature, pub)) continue;
-        EnsureSessionForPeer(resp.responderNodeId, peer ? peer->GetRemoteNickname() : std::string(), msg.sessionId);
-        AppendStoredPrivateMessage(msg, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
-        ++imported;
+        if (msg.sequenceNumber > 0) {
+            auto before = HasStoredMessageForPeer(resp.responderNodeId, msg.messageId);
+            BufferOrDeliverIncomingPrivateMessage(msg, pub, 0, false);
+            auto after = HasStoredMessageForPeer(resp.responderNodeId, msg.messageId);
+            if (!before && after) ++imported;
+        } else {
+            EnsureSessionForPeer(resp.responderNodeId, peer ? peer->GetRemoteNickname() : std::string(), msg.sessionId);
+            AppendStoredPrivateMessage(msg, StoredMessageDirection::Incoming, StoredMessageState::Delivered, pub);
+            ++imported;
+        }
     }
     if (imported > 0) {
         utils::LogSystem("History sync imported " + std::to_string(imported) + " message(s) from " + resp.responderNodeId);
@@ -1431,6 +1537,110 @@ void P2PNode::HandleUdpPunchRequest(const std::shared_ptr<PeerConnection>& peer,
 
     auto packet = protocol::MakePacket(PacketType::UdpPunchRequest, packetId, payload);
     BroadcastRaw(packet, peer ? peer->GetRemoteNodeId() : "");
+}
+
+std::uint64_t P2PNode::GetNextOutgoingSequence(const NodeId& peerNodeId) {
+    std::lock_guard<std::mutex> lock(sequenceMutex_);
+    auto it = nextOutgoingSequenceByPeer_.find(peerNodeId);
+    if (it != nextOutgoingSequenceByPeer_.end()) {
+        return it->second++;
+    }
+
+    std::vector<StoredConversationMessage> messages;
+    std::string error;
+    std::uint64_t maxSeq = 0;
+    if (ConversationStore::LoadConversation(historyRootDir_, local_.nodeId, peerNodeId, signer_, messages, &error)) {
+        for (const auto& msg : messages) {
+            if (msg.direction == StoredMessageDirection::Outgoing) maxSeq = std::max(maxSeq, msg.sequenceNumber);
+        }
+    }
+    auto& next = nextOutgoingSequenceByPeer_[peerNodeId];
+    next = maxSeq + 1;
+    return next++;
+}
+
+std::uint64_t P2PNode::GetExpectedIncomingSequence(const NodeId& peerNodeId) {
+    std::lock_guard<std::mutex> lock(sequenceMutex_);
+    auto it = expectedIncomingSequenceByPeer_.find(peerNodeId);
+    if (it != expectedIncomingSequenceByPeer_.end()) return it->second;
+
+    std::vector<StoredConversationMessage> messages;
+    std::string error;
+    std::uint64_t maxSeq = 0;
+    if (ConversationStore::LoadConversation(historyRootDir_, local_.nodeId, peerNodeId, signer_, messages, &error)) {
+        for (const auto& msg : messages) {
+            if (msg.direction == StoredMessageDirection::Incoming) maxSeq = std::max(maxSeq, msg.sequenceNumber);
+        }
+    }
+    auto& expected = expectedIncomingSequenceByPeer_[peerNodeId];
+    expected = maxSeq + 1;
+    if (expected == 0) expected = 1;
+    return expected;
+}
+
+void P2PNode::DeliverOrderedIncomingPrivateMessage(const PrivateMessagePayload& payload, const ByteVector& signerPublicKeyBlob, PacketId ackedRelayPacketId, bool logMessage) {
+    if (HasStoredMessageForPeer(payload.fromNodeId, payload.messageId)) {
+        SendDeliveryAck(payload, ackedRelayPacketId);
+        return;
+    }
+    EnsureSessionForPeer(payload.fromNodeId, payload.fromNickname, payload.sessionId);
+    AppendStoredPrivateMessage(payload, StoredMessageDirection::Incoming, StoredMessageState::Delivered, signerPublicKeyBlob);
+    SendDeliveryAck(payload, ackedRelayPacketId);
+    if (logMessage) utils::LogPrivate(payload.fromNickname, payload.text);
+}
+
+void P2PNode::BufferOrDeliverIncomingPrivateMessage(const PrivateMessagePayload& payload, const ByteVector& signerPublicKeyBlob, PacketId ackedRelayPacketId, bool logMessage) {
+    if (payload.sequenceNumber == 0) {
+        DeliverOrderedIncomingPrivateMessage(payload, signerPublicKeyBlob, ackedRelayPacketId, logMessage);
+        return;
+    }
+
+    std::vector<BufferedIncomingPrivateMessage> ready;
+    {
+        std::lock_guard<std::mutex> lock(sequenceMutex_);
+        auto expectedIt = expectedIncomingSequenceByPeer_.find(payload.fromNodeId);
+        if (expectedIt == expectedIncomingSequenceByPeer_.end()) {
+            std::uint64_t maxSeq = 0;
+            std::vector<StoredConversationMessage> messages;
+            std::string error;
+            if (ConversationStore::LoadConversation(historyRootDir_, local_.nodeId, payload.fromNodeId, signer_, messages, &error)) {
+                for (const auto& msg : messages) {
+                    if (msg.direction == StoredMessageDirection::Incoming) maxSeq = std::max(maxSeq, msg.sequenceNumber);
+                }
+            }
+            expectedIt = expectedIncomingSequenceByPeer_.emplace(payload.fromNodeId, maxSeq + 1).first;
+            if (expectedIt->second == 0) expectedIt->second = 1;
+        }
+
+        auto& expected = expectedIt->second;
+        if (payload.sequenceNumber < expected) {
+            // already delivered or stale retry
+        } else if (payload.sequenceNumber > expected) {
+            auto& buffer = reorderBufferByPeer_[payload.fromNodeId];
+            buffer.try_emplace(payload.sequenceNumber, BufferedIncomingPrivateMessage{payload, signerPublicKeyBlob, ackedRelayPacketId, logMessage});
+            return;
+        } else {
+            ready.push_back(BufferedIncomingPrivateMessage{payload, signerPublicKeyBlob, ackedRelayPacketId, logMessage});
+            ++expected;
+            auto bufIt = reorderBufferByPeer_.find(payload.fromNodeId);
+            while (bufIt != reorderBufferByPeer_.end()) {
+                auto nextIt = bufIt->second.find(expected);
+                if (nextIt == bufIt->second.end()) break;
+                ready.push_back(nextIt->second);
+                bufIt->second.erase(nextIt);
+                ++expected;
+            }
+            if (bufIt != reorderBufferByPeer_.end() && bufIt->second.empty()) reorderBufferByPeer_.erase(bufIt);
+        }
+    }
+
+    if (ready.empty()) {
+        SendDeliveryAck(payload, ackedRelayPacketId);
+        return;
+    }
+    for (const auto& item : ready) {
+        DeliverOrderedIncomingPrivateMessage(item.payload, item.signerPublicKeyBlob, item.ackedRelayPacketId, item.logMessage);
+    }
 }
 
 void P2PNode::AppendStoredPrivateMessage(const PrivateMessagePayload& payload, StoredMessageDirection direction, StoredMessageState state, const ByteVector& signerPublicKeyBlob) {
@@ -1644,7 +1854,8 @@ void P2PNode::PrintKnownNodes() const {
     utils::LogRaw("=== Users ===");
     if (users.empty()) utils::LogRaw("  (none)");
     for (const auto& u : users) {
-        utils::LogRaw("[" + std::to_string(u.index) + "] " + u.nickname + " " + (u.online ? "online" : "known") + " id=" + u.nodeId);
+        std::string status = u.online ? "online" : ("last seen " + std::to_string(u.lastSeenSecondsAgo) + "s ago");
+        utils::LogRaw("[" + std::to_string(u.index) + "] " + u.nickname + " " + status + " id=" + u.nodeId);
     }
 }
 
@@ -1699,7 +1910,14 @@ std::vector<DisplayUser> P2PNode::GetDisplayUsers() const {
 
     std::vector<DisplayUser> result;
     int i = 1;
-    for (const auto& n : nodes) result.push_back({i++, n.nodeId, n.nickname, online.contains(n.nodeId)});
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& n : nodes) {
+        std::uint64_t lastSeenSecondsAgo = 0;
+        if (now > n.lastSeen) {
+            lastSeenSecondsAgo = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now - n.lastSeen).count());
+        }
+        result.push_back({i++, n.nodeId, n.nickname, online.contains(n.nodeId), lastSeenSecondsAgo});
+    }
     return result;
 }
 
@@ -1712,6 +1930,10 @@ void P2PNode::BroadcastRaw(const ByteVector& packet, const NodeId& excludeNodeId
 }
 
 void P2PNode::OnPeerDisconnected(SOCKET socket) {
+    {
+        std::lock_guard<std::mutex> lock(rateLimitMutex_);
+        rateLimitBySocket_.erase(socket);
+    }
     if (socket == INVALID_SOCKET) return;
 
     {
@@ -1733,6 +1955,11 @@ void P2PNode::OnPeerDisconnected(SOCKET socket) {
         p->RequestClose();
 
         if (!remoteNodeId.empty()) {
+            if (auto known = knownNodes_.FindByNodeId(remoteNodeId)) {
+                known->lastSeen = std::chrono::steady_clock::now();
+                knownNodes_.Upsert(*known);
+            }
+            NoteReconnectFailure(remoteNodeId);
             std::lock_guard<std::mutex> lock(sessionsMutex_);
             auto it = sessionByPeer_.find(remoteNodeId);
             if (it != sessionByPeer_.end()) {
@@ -1752,6 +1979,13 @@ bool P2PNode::ShouldAttemptAutoConnect(const KnownNode& node) {
     if (peerManager_.HasNode(node.nodeId)) return false;
 
     auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(reconnectMutex_);
+        auto it = reconnectStates_.find(node.nodeId);
+        if (it != reconnectStates_.end() && it->second.nextAttempt != std::chrono::steady_clock::time_point{} && now < it->second.nextAttempt) {
+            return false;
+        }
+    }
     std::lock_guard<std::mutex> lock(connectAttemptsMutex_);
     auto it = lastConnectAttempt_.find(node.nodeId);
     if (it != lastConnectAttempt_.end()) {
@@ -1766,6 +2000,21 @@ void P2PNode::MarkConnectAttempt(const NodeId& nodeId) {
     lastConnectAttempt_[nodeId] = std::chrono::steady_clock::now();
 }
 
+void P2PNode::NoteReconnectFailure(const NodeId& nodeId) {
+    if (nodeId.empty()) return;
+    std::lock_guard<std::mutex> lock(reconnectMutex_);
+    auto& state = reconnectStates_[nodeId];
+    state.failureCount = std::min<std::uint32_t>(state.failureCount + 1, 8u);
+    const auto delaySeconds = std::min<std::uint32_t>(60u, 1u << std::min<std::uint32_t>(state.failureCount - 1, 5u));
+    state.nextAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(delaySeconds);
+}
+
+void P2PNode::ResetReconnectState(const NodeId& nodeId) {
+    if (nodeId.empty()) return;
+    std::lock_guard<std::mutex> lock(reconnectMutex_);
+    reconnectStates_.erase(nodeId);
+}
+
 bool P2PNode::TryConnectToKnownNode(const KnownNode& node) {
     if (node.ip.empty()) return false;
 
@@ -1774,11 +2023,15 @@ bool P2PNode::TryConnectToKnownNode(const KnownNode& node) {
     if (node.observedPort != 0 && node.observedPort != node.port) ports.push_back(node.observedPort);
 
     bool connected = false;
+    MarkConnectAttempt(node.nodeId);
     for (auto port : ports) {
         if (ConnectToPeer(node.ip, port)) {
             connected = true;
             break;
         }
+    }
+    if (!connected) {
+        NoteReconnectFailure(node.nodeId);
     }
     return connected;
 }
