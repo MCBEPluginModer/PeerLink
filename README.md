@@ -1,54 +1,93 @@
-# PeerLink
+# PeerLink — Secure P2P Messenger
 
-**PeerLink** is a decentralized peer-to-peer messenger written in C++, designed as a foundation for a resilient communication network without a mandatory central message server.
+PeerLink is a peer-to-peer encrypted messenger designed for decentralized communication without central servers.
 
-The project is being developed with long-term mass adoption in mind. The current builds are early-stage and intended for testing, feedback, and iterative improvement of the network architecture, delivery reliability, and peer discovery mechanisms.
+The project focuses on strong identity verification, trust management, and resilient peer-to-peer networking.
 
-## Current goals
-
-PeerLink is focused on building a practical distributed messaging system that can operate in real-world network conditions, including unstable direct connectivity, partial peer availability, and offline message delivery scenarios.
-
-## Current features
-
-- direct peer-to-peer messaging
-- persistent local node identity
-- local chat history storage
-- history restoration after application restart
-- private chat session recovery
-- NAT traversal improvements
-- reverse connect fallback
-- UDP hole punching fallback
-- relay-based message delivery
-- offline delivery through relay nodes
-- ACK-based delivery confirmation
-- retry with backoff
-- history synchronization after reconnect
-- bootstrap nodes support
-- automatic private chat close when direct peer disconnects
-- local chat history deletion
-
-## Project status
-
-**Status:** Early Alpha / Active Development
-
-PeerLink is under active development. The current version is suitable for testing, network experiments, and small-scale usage by technical users, but it is not yet a production-ready массовый messenger.
+Built entirely in C++ using WinSock and Windows CryptoAPI.
 
 ---
 
-# Build requirements
+# Features
 
-PeerLink currently targets **Windows**.
+## Networking
 
-Required tools and components:
+- Direct peer-to-peer TCP connections
+- Bootstrap node discovery
+- Known peer exchange
+- Heartbeat and reconnect logic
+- Relay fallback support
+- Basic NAT traversal logic
 
-- Windows 10/11
-- a modern C++ compiler
-- **xmake**
-- WinSock / WinAPI
-- CryptoAPI
-- Visual Studio Build Tools or Visual Studio with C++ toolchain
+---
 
-## Check xmake
+## Identity System
 
-```bash
-xmake --version
+- Persistent node identity
+- RSA public/private key pairs
+- Identity fingerprint verification
+- Key pinning per contact
+- Identity migration support
+- Device replacement flow
+
+---
+
+## Trust Model
+
+- Trusted / Untrusted contacts
+- Block / Unblock contacts
+- Manual trust management
+- Key mismatch detection
+- Manual re-pin workflow
+- Manual distrust on mismatch
+
+---
+
+## Messaging
+
+- End-to-end encrypted private messages
+- RSA key exchange
+- AES encrypted payloads
+- Message signature verification
+- Delivery acknowledgements
+- Offline relay message queue
+
+---
+
+## Session Management
+
+Private session state machine:
+
+- pending-outgoing-invite
+- pending-incoming-invite
+- awaiting-key
+- active
+- mismatch
+- closed
+
+Session lifecycle control:
+
+- Session reset
+- Session rekey
+- Session recovery
+
+---
+
+## Storage
+
+Local-only storage model:
+
+- Contacts database
+- Identity store
+- Message history
+- Relay spool
+- Trust metadata
+
+No central storage is used.
+
+---
+
+# Commands
+
+Core CLI commands:
+MCBEPluginModer
