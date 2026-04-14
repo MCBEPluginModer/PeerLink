@@ -103,6 +103,8 @@ struct InviteRequestPayload {
     NodeId fromNodeId;
     std::string fromNickname;
     NodeId toNodeId;
+    ByteVector fromPublicKeyBlob;
+    ByteVector fromEncryptPublicKeyBlob;
     ByteVector signature;
 };
 
@@ -112,6 +114,9 @@ struct InviteAcceptPayload {
     NodeId fromNodeId;
     std::string fromNickname;
     NodeId toNodeId;
+    ByteVector fromPublicKeyBlob;
+    ByteVector fromEncryptPublicKeyBlob;
+    ByteVector encryptedSessionKeyBlob;
     ByteVector signature;
 };
 
@@ -121,6 +126,8 @@ struct InviteRejectPayload {
     std::string fromNickname;
     NodeId toNodeId;
     std::string reason;
+    ByteVector fromPublicKeyBlob;
+    ByteVector fromEncryptPublicKeyBlob;
     ByteVector signature;
 };
 
@@ -132,6 +139,8 @@ struct PrivateMessagePayload {
     std::string fromNickname;
     NodeId toNodeId;
     std::string text;
+    ByteVector iv;
+    ByteVector ciphertext;
     ByteVector signature;
 };
 
@@ -226,11 +235,24 @@ struct PendingInvite {
     NodeId toNodeId;
 };
 
+enum class PrivateSessionState : std::uint8_t {
+    PendingOutgoingInvite = 1,
+    PendingIncomingInvite = 2,
+    AwaitingKey = 3,
+    Active = 4,
+    Mismatch = 5,
+    Closed = 6
+};
+
 struct PrivateSession {
     SessionId sessionId = 0;
     NodeId peerNodeId;
     std::string peerNickname;
+    ByteVector sessionKey;
     bool active = false;
+    PrivateSessionState state = PrivateSessionState::AwaitingKey;
+    std::string lastError;
+    std::int64_t stateUpdatedAtUnix = 0;
 };
 
 struct DisplayUser {
@@ -239,6 +261,13 @@ struct DisplayUser {
     std::string nickname;
     bool online = false;
     std::uint64_t lastSeenSecondsAgo = 0;
+};
+
+struct DisplayInvite {
+    int index = 0;
+    InviteId inviteId = 0;
+    NodeId fromNodeId;
+    std::string fromNickname;
 };
 
 struct BootstrapEndpoint {

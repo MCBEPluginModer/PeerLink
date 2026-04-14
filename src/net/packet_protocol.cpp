@@ -83,6 +83,8 @@ std::vector<std::uint8_t> SerializeInviteRequest(const InviteRequestPayload& pay
     utils::WriteString(out, payload.fromNodeId);
     utils::WriteString(out, payload.fromNickname);
     utils::WriteString(out, payload.toNodeId);
+    utils::WriteBytes(out, payload.fromPublicKeyBlob);
+    utils::WriteBytes(out, payload.fromEncryptPublicKeyBlob);
     utils::WriteBytes(out, payload.signature);
     return out;
 }
@@ -93,6 +95,8 @@ bool DeserializeInviteRequest(const ByteVector& data, InviteRequestPayload& payl
     if (!utils::ReadString(data, offset, payload.fromNodeId)) return false;
     if (!utils::ReadString(data, offset, payload.fromNickname)) return false;
     if (!utils::ReadString(data, offset, payload.toNodeId)) return false;
+    if (!utils::ReadBytes(data, offset, payload.fromPublicKeyBlob)) return false;
+    if (!utils::ReadBytes(data, offset, payload.fromEncryptPublicKeyBlob)) return false;
     if (!utils::ReadBytes(data, offset, payload.signature)) return false;
     return offset == data.size();
 }
@@ -104,6 +108,9 @@ std::vector<std::uint8_t> SerializeInviteAccept(const InviteAcceptPayload& paylo
     utils::WriteString(out, payload.fromNodeId);
     utils::WriteString(out, payload.fromNickname);
     utils::WriteString(out, payload.toNodeId);
+    utils::WriteBytes(out, payload.fromPublicKeyBlob);
+    utils::WriteBytes(out, payload.fromEncryptPublicKeyBlob);
+    utils::WriteBytes(out, payload.encryptedSessionKeyBlob);
     utils::WriteBytes(out, payload.signature);
     return out;
 }
@@ -115,6 +122,9 @@ bool DeserializeInviteAccept(const ByteVector& data, InviteAcceptPayload& payloa
     if (!utils::ReadString(data, offset, payload.fromNodeId)) return false;
     if (!utils::ReadString(data, offset, payload.fromNickname)) return false;
     if (!utils::ReadString(data, offset, payload.toNodeId)) return false;
+    if (!utils::ReadBytes(data, offset, payload.fromPublicKeyBlob)) return false;
+    if (!utils::ReadBytes(data, offset, payload.fromEncryptPublicKeyBlob)) return false;
+    if (!utils::ReadBytes(data, offset, payload.encryptedSessionKeyBlob)) return false;
     if (!utils::ReadBytes(data, offset, payload.signature)) return false;
     return offset == data.size();
 }
@@ -126,6 +136,8 @@ std::vector<std::uint8_t> SerializeInviteReject(const InviteRejectPayload& paylo
     utils::WriteString(out, payload.fromNickname);
     utils::WriteString(out, payload.toNodeId);
     utils::WriteString(out, payload.reason);
+    utils::WriteBytes(out, payload.fromPublicKeyBlob);
+    utils::WriteBytes(out, payload.fromEncryptPublicKeyBlob);
     utils::WriteBytes(out, payload.signature);
     return out;
 }
@@ -137,6 +149,8 @@ bool DeserializeInviteReject(const ByteVector& data, InviteRejectPayload& payloa
     if (!utils::ReadString(data, offset, payload.fromNickname)) return false;
     if (!utils::ReadString(data, offset, payload.toNodeId)) return false;
     if (!utils::ReadString(data, offset, payload.reason)) return false;
+    if (!utils::ReadBytes(data, offset, payload.fromPublicKeyBlob)) return false;
+    if (!utils::ReadBytes(data, offset, payload.fromEncryptPublicKeyBlob)) return false;
     if (!utils::ReadBytes(data, offset, payload.signature)) return false;
     return offset == data.size();
 }
@@ -149,7 +163,8 @@ std::vector<std::uint8_t> SerializePrivateMessage(const PrivateMessagePayload& p
     utils::WriteString(out, payload.fromNodeId);
     utils::WriteString(out, payload.fromNickname);
     utils::WriteString(out, payload.toNodeId);
-    utils::WriteString(out, payload.text);
+    utils::WriteBytes(out, payload.iv);
+    utils::WriteBytes(out, payload.ciphertext);
     utils::WriteBytes(out, payload.signature);
     return out;
 }
@@ -162,7 +177,8 @@ bool DeserializePrivateMessage(const ByteVector& data, PrivateMessagePayload& pa
     if (!utils::ReadString(data, offset, payload.fromNodeId)) return false;
     if (!utils::ReadString(data, offset, payload.fromNickname)) return false;
     if (!utils::ReadString(data, offset, payload.toNodeId)) return false;
-    if (!utils::ReadString(data, offset, payload.text)) return false;
+    if (!utils::ReadBytes(data, offset, payload.iv)) return false;
+    if (!utils::ReadBytes(data, offset, payload.ciphertext)) return false;
     if (!utils::ReadBytes(data, offset, payload.signature)) return false;
     return offset == data.size();
 }

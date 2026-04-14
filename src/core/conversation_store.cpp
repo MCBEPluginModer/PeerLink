@@ -30,6 +30,8 @@ struct StoredRecord {
     std::string fromNicknameHex;
     std::string toNodeId;
     std::string textHex;
+    std::string ivHex;
+    std::string ciphertextHex;
     std::string signatureHex;
     std::string signerPublicKeyHex;
     std::string storedAtUtc;
@@ -183,6 +185,8 @@ ByteVector BuildStoredRecordHashData(const StoredRecord& r) {
     utils::WriteString(out, r.fromNicknameHex);
     utils::WriteString(out, r.toNodeId);
     utils::WriteString(out, r.textHex);
+    utils::WriteString(out, r.ivHex);
+    utils::WriteString(out, r.ciphertextHex);
     utils::WriteString(out, r.signatureHex);
     utils::WriteString(out, r.signerPublicKeyHex);
     utils::WriteString(out, r.storedAtUtc);
@@ -275,6 +279,8 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     auto fromNickHex = ExtractJsonString(line, "from_nickname_hex");
     auto toNodeId = ExtractJsonString(line, "to_node_id");
     auto textHex = ExtractJsonString(line, "text_hex");
+    auto ivHex = ExtractJsonString(line, "iv_hex");
+    auto ciphertextHex = ExtractJsonString(line, "ciphertext_hex");
     auto signatureHex = ExtractJsonString(line, "signature_hex");
     auto signerPubHex = ExtractJsonString(line, "signer_public_key_hex");
     auto storedAt = ExtractJsonString(line, "stored_at_utc");
@@ -294,6 +300,8 @@ std::optional<StoredRecord> ParseRecordJson(const std::string& line) {
     r.fromNicknameHex = *fromNickHex;
     r.toNodeId = *toNodeId;
     r.textHex = *textHex;
+    r.ivHex = *ivHex;
+    r.ciphertextHex = *ciphertextHex;
     r.signatureHex = *signatureHex;
     r.signerPublicKeyHex = *signerPubHex;
     r.storedAtUtc = *storedAt;
@@ -428,9 +436,11 @@ bool VerifyConversationFileInternal(const fs::path& convoPath,
         PrivateMessagePayload payload{};
         auto nick = HexToString(r.fromNicknameHex);
         auto text = HexToString(r.textHex);
+        auto iv = HexToBytes(r.ivHex);
+        auto cipher = HexToBytes(r.ciphertextHex);
         auto sig = HexToBytes(r.signatureHex);
         auto pub = HexToBytes(r.signerPublicKeyHex);
-        if (!nick || !text || !sig || !pub) {
+        if (!nick || !text || !iv || !cipher || !sig || !pub) {
             if (error) *error = "Stored message decode failed";
             return false;
         }
@@ -441,6 +451,8 @@ bool VerifyConversationFileInternal(const fs::path& convoPath,
         payload.fromNickname = *nick;
         payload.toNodeId = r.toNodeId;
         payload.text = *text;
+        payload.iv = *iv;
+        payload.ciphertext = *cipher;
         payload.signature = *sig;
 
         ByteVector signData;
@@ -450,7 +462,8 @@ bool VerifyConversationFileInternal(const fs::path& convoPath,
         utils::WriteString(signData, payload.fromNodeId);
         utils::WriteString(signData, payload.fromNickname);
         utils::WriteString(signData, payload.toNodeId);
-        utils::WriteString(signData, payload.text);
+        utils::WriteBytes(signData, payload.iv);
+        utils::WriteBytes(signData, payload.ciphertext);
 
         if (!signer.Verify(signData, payload.signature, *pub)) {
             if (error) *error = "Stored message signature invalid";
@@ -547,6 +560,8 @@ bool ConversationStore::AppendPrivateMessage(const std::string& rootDir,
         record.fromNicknameHex = StringToHex(payload.fromNickname);
         record.toNodeId = payload.toNodeId;
         record.textHex = StringToHex(payload.text);
+        record.ivHex = BytesToHex(payload.iv);
+        record.ciphertextHex = BytesToHex(payload.ciphertext);
         record.signatureHex = BytesToHex(payload.signature);
         record.signerPublicKeyHex = BytesToHex(signerPublicKeyBlob);
         record.storedAtUtc = CurrentUtcIso8601();
@@ -629,7 +644,9 @@ bool ConversationStore::LoadConversation(const std::string& rootDir,
             }
             auto nick = HexToString(record->fromNicknameHex);
             auto text = HexToString(record->textHex);
-            if (!nick || !text) {
+            auto iv = HexToBytes(record->ivHex);
+            auto cipher = HexToBytes(record->ciphertextHex);
+            if (!nick || !text || !iv || !cipher) {
                 if (error) *error = "Stored message decode failed";
                 return false;
             }
@@ -643,6 +660,8 @@ bool ConversationStore::LoadConversation(const std::string& rootDir,
             msg.fromNickname = *nick;
             msg.toNodeId = record->toNodeId;
             msg.text = *text;
+            msg.iv = *iv;
+            msg.ciphertext = *cipher;
             msg.storedAtUtc = record->storedAtUtc;
             msg.state = StoredMessageStateFromString(record->state);
             auto overrideIt = stateOverrides.find(msg.messageId);
@@ -801,9 +820,11 @@ bool ConversationStore::LoadSignedOutgoingMessagesAfter(const std::string& rootD
             if (record->direction != "out" || record->messageId <= afterMessageId) continue;
             auto nick = HexToString(record->fromNicknameHex);
             auto text = HexToString(record->textHex);
+            auto iv = HexToBytes(record->ivHex);
+            auto cipher = HexToBytes(record->ciphertextHex);
             auto sig = HexToBytes(record->signatureHex);
             auto pub = HexToBytes(record->signerPublicKeyHex);
-            if (!nick || !text || !sig || !pub) {
+            if (!nick || !text || !iv || !cipher || !sig || !pub) {
                 if (error) *error = "Stored message decode failed";
                 return false;
             }
@@ -815,6 +836,8 @@ bool ConversationStore::LoadSignedOutgoingMessagesAfter(const std::string& rootD
             msg.payload.fromNickname = *nick;
             msg.payload.toNodeId = record->toNodeId;
             msg.payload.text = *text;
+            msg.payload.iv = *iv;
+            msg.payload.ciphertext = *cipher;
             msg.payload.signature = *sig;
             msg.signerPublicKeyBlob = *pub;
             outMessages.push_back(std::move(msg));

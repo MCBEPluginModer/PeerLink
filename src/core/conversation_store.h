@@ -32,6 +32,8 @@ struct StoredConversationMessage {
     std::string fromNickname;
     NodeId toNodeId;
     std::string text;
+    ByteVector iv;
+    ByteVector ciphertext;
     std::string storedAtUtc;
     StoredMessageState state = StoredMessageState::Created;
 };

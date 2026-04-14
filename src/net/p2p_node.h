@@ -1,5 +1,7 @@
 #pragma once
+#include "core/contact_store.h"
 #include "core/conversation_store.h"
+#include "core/fingerprint_utils.h"
 #include "core/types.h"
 #include "crypto/crypto_signer.h"
 #include "net/known_nodes.h"
@@ -31,11 +33,29 @@ public:
     bool DeleteConversationHistory(const NodeId& peerNodeId);
     bool IsPeerConnected(const NodeId& peerNodeId) const;
 
+    bool AddOrUpdateContact(const NodeId& peerNodeId, const std::string& nickname = "");
+    bool RemoveContact(const NodeId& peerNodeId);
+    bool RenameContact(const NodeId& peerNodeId, const std::string& newNickname);
+    bool AddContactFromInviteCode(const std::string& inviteCode);
+    std::string BuildLocalInviteCode() const;
+    void PrintContacts() const;
+    void PrintFingerprint() const;
+    bool TrustContactByIndex(int index);
+    bool UntrustContactByIndex(int index);
+    bool BlockContactByIndex(int index);
+    bool UnblockContactByIndex(int index);
+    bool RePinContactByIndex(int index);
+    bool DistrustMismatchByIndex(int index);
+    bool ApproveIdentityMigrationByIndex(int index);
+    bool ResetSessionByIndex(int index);
+    bool RekeySessionByIndex(int index);
+
     void PrintKnownNodes() const;
     void PrintInvites() const;
     void PrintSessions() const;
     void PrintInfo() const;
     std::vector<DisplayUser> GetDisplayUsers() const;
+    std::vector<DisplayInvite> GetDisplayInvites() const;
 
     void OnPacket(const std::shared_ptr<PeerConnection>& peer, PacketType type, PacketId packetId, const ByteVector& payload);
     void OnPeerDisconnected(SOCKET socket);
@@ -87,10 +107,21 @@ private:
     std::optional<PendingInvite> FindIncomingInviteByFromNodeId(const NodeId& fromNodeId) const;
     std::optional<SessionId> FindSessionByPeer(const NodeId& peerNodeId) const;
 
+    bool SaveContacts() const;
+    void LoadContacts();
+    std::optional<ContactEntry> FindContact(const NodeId& peerNodeId) const;
+    std::string ResolveDisplayName(const NodeId& peerNodeId, const std::string& fallback = "") const;
+    void UpsertContactHintsFromKnownNode(const KnownNode& node);
+    bool CanInteractWithContact(const NodeId& peerNodeId, bool requireTrusted, std::string* error = nullptr) const;
+    bool GetVerificationPublicKeyForPeer(const NodeId& peerNodeId, const ByteVector& advertisedPublicKey, const ByteVector* advertisedEncryptPublicKey, ByteVector& out, std::string* error = nullptr);
+    bool StoreVerifiedPeerIdentity(const NodeId& peerNodeId, const std::string& nickname, const ByteVector& verifiedPublicKey, const ByteVector& verifiedEncryptPublicKey, bool createIfMissing, bool trustNewContact, std::string* error = nullptr);
+
     ByteVector BuildInviteRequestSignedData(const InviteRequestPayload& p) const;
     ByteVector BuildInviteAcceptSignedData(const InviteAcceptPayload& p) const;
     ByteVector BuildInviteRejectSignedData(const InviteRejectPayload& p) const;
     ByteVector BuildPrivateMessageSignedData(const PrivateMessagePayload& p) const;
+    bool EncryptPrivateMessagePayload(PrivateMessagePayload& payload, const ByteVector& sessionKey) const;
+    bool DecryptPrivateMessagePayload(PrivateMessagePayload& payload, const ByteVector& sessionKey) const;
     ByteVector BuildMessageAckSignedData(const MessageAckPayload& p) const;
     ByteVector BuildConnectRequestSignedData(const ConnectRequestPayload& p) const;
     ByteVector BuildUdpPunchRequestSignedData(const UdpPunchRequestPayload& p) const;
@@ -119,7 +150,15 @@ private:
     void RemoveQueuedRelayMessageByMessageId(const NodeId& targetNodeId, MessageId messageId);
     void RemoveQueuedRelayAckByMessageId(const NodeId& targetNodeId, MessageId messageId);
     void SendDeliveryAck(const PrivateMessagePayload& message, PacketId ackedRelayPacketId);
+    void SetSessionState(const NodeId& peerNodeId, SessionId sessionId, PrivateSessionState state, const std::string& error = "");
+    std::string DescribeSessionState(const PrivateSession& session) const;
+    void MarkContactKeyMismatch(const NodeId& peerNodeId, const ByteVector& advertisedPublicKey, const ByteVector* advertisedEncryptPublicKey = nullptr, const std::string& nicknameHint = "");
+    bool ClearContactKeyMismatch(const NodeId& peerNodeId, bool adoptPendingKey, bool trustAfterAdopt, bool markMigration, std::string* error = nullptr);
+    bool ResetSessionForPeer(const NodeId& peerNodeId, const std::string& reason, PrivateSessionState newState = PrivateSessionState::Closed);
+    void DropInvitesForPeer(const NodeId& peerNodeId);
     void EnsureSessionForPeer(const NodeId& peerNodeId, const std::string& peerNickname, SessionId sessionId);
+    bool SetSessionKeyForPeer(const NodeId& peerNodeId, SessionId sessionId, const ByteVector& sessionKey);
+    bool GetSessionKeyForPeer(const NodeId& peerNodeId, ByteVector& sessionKeyOut) const;
     void RequestHistorySync(const NodeId& peerNodeId);
     void RetryRelayQueues();
     bool SaveRelaySpoolToDisk() const;
@@ -148,7 +187,9 @@ private:
 
     mutable std::mutex publicKeysMutex_;
     std::unordered_map<NodeId, ByteVector> publicKeys_;
+    std::unordered_map<NodeId, ByteVector> publicEncryptKeys_;
     ByteVector localPublicKeyBlob_;
+    ByteVector localEncryptPublicKeyBlob_;
     std::string historyRootDir_ = "history";
     std::string relaySpoolRootDir_ = "relay_spool";
     std::string bootstrapConfigPath_ = "bootstrap_nodes.txt";
@@ -214,6 +255,12 @@ private:
 
     mutable std::mutex rateLimitMutex_;
     std::unordered_map<SOCKET, RateLimiterState> rateLimitBySocket_;
+
+    std::string contactsRootDir_ = "contacts";
+    mutable std::mutex contactsMutex_;
+    std::unordered_map<NodeId, ContactEntry> contacts_;
+
+    const std::string sessionRootDir_ = "sessions";
 
     const std::chrono::seconds heartbeatInterval_{5};
     const std::chrono::seconds heartbeatTimeout_{30};
