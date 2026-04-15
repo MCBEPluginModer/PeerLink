@@ -34,6 +34,7 @@ P2PNode::P2PNode(std::string nickname, std::uint16_t listenPort) {
     self.lastSeen = std::chrono::steady_clock::now();
     knownNodes_.Upsert(self);
     LoadContacts();
+    LoadOverlayState();
 }
 
 P2PNode::~P2PNode() { Stop(); }
@@ -102,6 +103,65 @@ std::vector<p2p::ContactEntry> SortedContactsForDisplay(const std::unordered_map
     });
     return out;
 }
+
+std::vector<std::string> SplitPipe(const std::string& line) {
+    std::vector<std::string> parts;
+    std::stringstream ss(line);
+    std::string item;
+    while (std::getline(ss, item, '|')) parts.push_back(item);
+    return parts;
+}
+
+std::string JoinRole(const p2p::GroupRole role) {
+    return p2p::ToString(role);
+}
+
+constexpr std::size_t kInlineFileTransferLimit = 256 * 1024;
+constexpr std::size_t kFileChunkBytes = 12 * 1024;
+
+std::string ControlMessageKindToString(p2p::P2PNode::ControlMessageKind kind) {
+    using K = p2p::P2PNode::ControlMessageKind;
+    switch (kind) {
+        case K::GroupSync: return "groupsync";
+        case K::DeviceLink: return "device-link";
+        case K::DeviceRevoke: return "device-revoke";
+        case K::DeviceSync: return "device-sync";
+        case K::FileMeta: return "filemeta";
+        case K::FileOffer: return "fileoffer";
+        case K::FileAccept: return "fileaccept";
+        case K::FileReject: return "filereject";
+        case K::FileChunk: return "filechunk";
+        case K::GroupMessage: return "groupmsg";
+        default: return "unknown";
+    }
+}
+std::string ToString(p2p::P2PNode::FileTransferState state) {
+    using S = p2p::P2PNode::FileTransferState;
+    switch (state) {
+        case S::Offered: return "offered";
+        case S::Accepted: return "accepted";
+        case S::Transferring: return "transferring";
+        case S::Completed: return "completed";
+        case S::Rejected: return "rejected";
+        case S::Failed: return "failed";
+        default: return "unknown";
+    }
+}
+
+std::string ToString(p2p::P2PNode::ControlFlowState state) {
+    using S = p2p::P2PNode::ControlFlowState;
+    switch (state) {
+        case S::Idle: return "idle";
+        case S::Received: return "received";
+        case S::Parsed: return "parsed";
+        case S::Validated: return "validated";
+        case S::Applied: return "applied";
+        case S::Rejected: return "rejected";
+        case S::Failed: return "failed";
+        default: return "unknown";
+    }
+}
+
 }
 
 bool P2PNode::LoadOrCreateLocalIdentity() {
@@ -176,17 +236,8 @@ void P2PNode::LoadContacts() {
         if (!error.empty()) utils::LogError("Failed to load contacts: " + error);
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        contacts_ = loaded;
-    }
-    {
-        std::lock_guard<std::mutex> lock(publicKeysMutex_);
-        for (const auto& [nodeId, c] : loaded) {
-            if (!c.publicKeyBlob.empty()) publicKeys_[nodeId] = c.publicKeyBlob;
-            if (!c.encryptPublicKeyBlob.empty()) publicEncryptKeys_[nodeId] = c.encryptPublicKeyBlob;
-        }
-    }
+    std::lock_guard<std::mutex> lock(contactsMutex_);
+    contacts_ = std::move(loaded);
 }
 
 std::optional<ContactEntry> P2PNode::FindContact(const NodeId& peerNodeId) const {
@@ -223,177 +274,6 @@ void P2PNode::UpsertContactHintsFromKnownNode(const KnownNode& node) {
     if (changed) SaveContacts();
 }
 
-bool P2PNode::CanInteractWithContact(const NodeId& peerNodeId, bool requireTrusted, std::string* error) const {
-    auto contact = FindContact(peerNodeId);
-    if (!contact) {
-        if (error) *error = "Contact not found for node: " + peerNodeId;
-        return false;
-    }
-    if (contact->blocked) {
-        if (error) *error = "Contact is blocked: " + ResolveDisplayName(peerNodeId, contact->nickname);
-        return false;
-    }
-    if (contact->keyMismatch) {
-        if (error) *error = "Contact has a pending fingerprint mismatch: " + ResolveDisplayName(peerNodeId, contact->nickname) + ". Use /contacts and then /migrate, /repin, /distrustmismatch, or /block after manual verification.";
-        return false;
-    }
-    if (requireTrusted && !contact->trusted) {
-        if (error) *error = "Contact is not trusted yet: " + ResolveDisplayName(peerNodeId, contact->nickname);
-        return false;
-    }
-    return true;
-}
-
-bool P2PNode::GetVerificationPublicKeyForPeer(const NodeId& peerNodeId, const ByteVector& advertisedPublicKey, const ByteVector* advertisedEncryptPublicKey, ByteVector& out, std::string* error) {
-    out.clear();
-    bool shouldMarkMismatch = false;
-    std::string mismatchDisplayName;
-    std::string mismatchStoredFingerprint;
-
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto it = contacts_.find(peerNodeId);
-        if (it != contacts_.end()) {
-            mismatchDisplayName = !it->second.nickname.empty() ? it->second.nickname : peerNodeId;
-            mismatchStoredFingerprint = it->second.fingerprint;
-            if (it->second.blocked) {
-                if (error) *error = "Blocked contact attempted to use the protocol: " + mismatchDisplayName;
-                return false;
-            }
-            if (!it->second.publicKeyBlob.empty()) {
-                if (!advertisedPublicKey.empty() && it->second.publicKeyBlob != advertisedPublicKey) {
-                    shouldMarkMismatch = true;
-                } else {
-                    out = it->second.publicKeyBlob;
-                    return true;
-                }
-            }
-        }
-    }
-    if (shouldMarkMismatch) {
-        MarkContactKeyMismatch(peerNodeId, advertisedPublicKey, advertisedEncryptPublicKey, mismatchDisplayName);
-        if (error) *error = "Fingerprint/public key mismatch for contact: " + mismatchDisplayName + ". Stored fingerprint=" + mismatchStoredFingerprint + ", new fingerprint=" + ComputeFingerprint(advertisedPublicKey);
-        return false;
-    }
-
-    bool cachedMismatch = false;
-    {
-        std::lock_guard<std::mutex> lock(publicKeysMutex_);
-        auto it = publicKeys_.find(peerNodeId);
-        if (it != publicKeys_.end()) {
-            if (!advertisedPublicKey.empty() && it->second != advertisedPublicKey) {
-                cachedMismatch = true;
-            } else {
-                out = it->second;
-                return true;
-            }
-        }
-    }
-    if (cachedMismatch) {
-        MarkContactKeyMismatch(peerNodeId, advertisedPublicKey, advertisedEncryptPublicKey);
-        if (error) *error = "Observed public key changed for node: " + peerNodeId + ". New fingerprint=" + ComputeFingerprint(advertisedPublicKey);
-        return false;
-    }
-
-    if (advertisedPublicKey.empty()) {
-        if (error) *error = "Missing public key for node: " + peerNodeId;
-        return false;
-    }
-    out = advertisedPublicKey;
-    if (advertisedEncryptPublicKey && !advertisedEncryptPublicKey->empty()) {
-        std::lock_guard<std::mutex> lock(publicKeysMutex_);
-        if (publicEncryptKeys_.find(peerNodeId) == publicEncryptKeys_.end()) {
-            publicEncryptKeys_[peerNodeId] = *advertisedEncryptPublicKey;
-        }
-    }
-    return true;
-}
-
-bool P2PNode::StoreVerifiedPeerIdentity(const NodeId& peerNodeId, const std::string& nickname, const ByteVector& verifiedPublicKey,
-                                        const ByteVector& verifiedEncryptPublicKey, bool createIfMissing, bool trustNewContact,
-                                        std::string* error) {
-    bool contactsChanged = false;
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto it = contacts_.find(peerNodeId);
-        if (it == contacts_.end()) {
-            if (createIfMissing) {
-                ContactEntry c{};
-                c.nodeId = peerNodeId;
-                c.nickname = nickname;
-                c.publicKeyBlob = verifiedPublicKey;
-                c.encryptPublicKeyBlob = verifiedEncryptPublicKey;
-                if (!verifiedPublicKey.empty()) c.fingerprint = ComputeFingerprint(verifiedPublicKey);
-                c.trusted = trustNewContact;
-                c.blocked = false;
-                c.keyMismatch = false;
-                c.pendingPublicKeyBlob.clear();
-                c.pendingEncryptPublicKeyBlob.clear();
-                c.pendingFingerprint.clear();
-                c.addedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
-                if (auto node = knownNodes_.FindByNodeId(peerNodeId)) {
-                    if (c.nickname.empty()) c.nickname = node->nickname;
-                    c.lastKnownIp = node->ip;
-                    c.lastKnownPort = node->port;
-                }
-                contacts_[peerNodeId] = std::move(c);
-                contactsChanged = true;
-            }
-        } else {
-            auto& c = it->second;
-            const std::string displayName = !c.nickname.empty() ? c.nickname : peerNodeId;
-            if (c.blocked) {
-                if (error) *error = "Blocked contact attempted to change identity state: " + displayName;
-                return false;
-            }
-            if (!nickname.empty() && (c.nickname.empty() || c.nickname == c.nodeId)) {
-                c.nickname = nickname;
-                contactsChanged = true;
-            }
-            if (!verifiedPublicKey.empty()) {
-                if (!c.publicKeyBlob.empty() && c.publicKeyBlob != verifiedPublicKey) {
-                    if (error) *error = "Refusing to replace pinned public key for contact: " + displayName;
-                    return false;
-                }
-                if (c.publicKeyBlob.empty()) {
-                    c.publicKeyBlob = verifiedPublicKey;
-                    c.fingerprint = ComputeFingerprint(verifiedPublicKey);
-                    contactsChanged = true;
-                }
-            }
-            if (!verifiedEncryptPublicKey.empty() && c.encryptPublicKeyBlob != verifiedEncryptPublicKey) {
-                c.encryptPublicKeyBlob = verifiedEncryptPublicKey;
-                contactsChanged = true;
-            }
-            if (c.keyMismatch || !c.pendingPublicKeyBlob.empty() || !c.pendingEncryptPublicKeyBlob.empty() || !c.pendingFingerprint.empty()) {
-                c.keyMismatch = false;
-                c.pendingPublicKeyBlob.clear();
-                c.pendingEncryptPublicKeyBlob.clear();
-                c.pendingFingerprint.clear();
-                contactsChanged = true;
-            }
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(publicKeysMutex_);
-        if (!verifiedPublicKey.empty()) {
-            auto it = publicKeys_.find(peerNodeId);
-            if (it != publicKeys_.end() && it->second != verifiedPublicKey) {
-                if (error) *error = "Refusing to replace cached public key for node: " + peerNodeId;
-                return false;
-            }
-            publicKeys_[peerNodeId] = verifiedPublicKey;
-        }
-        if (!verifiedEncryptPublicKey.empty()) {
-            publicEncryptKeys_[peerNodeId] = verifiedEncryptPublicKey;
-        }
-    }
-
-    if (contactsChanged) return SaveContacts();
-    return true;
-}
-
 bool P2PNode::AddOrUpdateContact(const NodeId& peerNodeId, const std::string& nickname) {
     if (peerNodeId.empty() || peerNodeId == local_.nodeId) return false;
     ContactEntry entry{};
@@ -402,48 +282,31 @@ bool P2PNode::AddOrUpdateContact(const NodeId& peerNodeId, const std::string& ni
         if (auto node = knownNodes_.FindByNodeId(peerNodeId)) resolvedNickname = node->nickname;
         if (resolvedNickname.empty()) resolvedNickname = peerNodeId;
     }
-
-    ByteVector observedPublicKey;
-    ByteVector observedEncryptPublicKey;
-    {
-        std::lock_guard<std::mutex> pk(publicKeysMutex_);
-        auto it = publicKeys_.find(peerNodeId);
-        if (it != publicKeys_.end()) observedPublicKey = it->second;
-        auto eit = publicEncryptKeys_.find(peerNodeId);
-        if (eit != publicEncryptKeys_.end()) observedEncryptPublicKey = eit->second;
-    }
-
     {
         std::lock_guard<std::mutex> lock(contactsMutex_);
         auto& c = contacts_[peerNodeId];
-        const bool isNew = c.nodeId.empty();
         c.nodeId = peerNodeId;
         if (!resolvedNickname.empty()) c.nickname = resolvedNickname;
+        c.trusted = true;
+        c.blocked = false;
         if (c.addedAtUnix == 0) c.addedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
         if (auto node = knownNodes_.FindByNodeId(peerNodeId)) {
             if (c.nickname.empty()) c.nickname = node->nickname;
             c.lastKnownIp = node->ip;
             c.lastKnownPort = node->port;
         }
-        if (c.publicKeyBlob.empty() && !observedPublicKey.empty()) {
-            c.publicKeyBlob = observedPublicKey;
-            c.fingerprint = ComputeFingerprint(c.publicKeyBlob);
+        {
+            std::lock_guard<std::mutex> pk(publicKeysMutex_);
+            auto it = publicKeys_.find(peerNodeId);
+            if (it != publicKeys_.end()) {
+                c.publicKeyBlob = it->second;
+                c.fingerprint = ComputeFingerprint(c.publicKeyBlob);
+            }
         }
-        if (c.encryptPublicKeyBlob.empty() && !observedEncryptPublicKey.empty()) {
-            c.encryptPublicKeyBlob = observedEncryptPublicKey;
-        }
-        if (!observedPublicKey.empty() && c.publicKeyBlob == observedPublicKey && c.keyMismatch) {
-            c.keyMismatch = false;
-            c.pendingPublicKeyBlob.clear();
-            c.pendingEncryptPublicKeyBlob.clear();
-            c.pendingFingerprint.clear();
-        }
-        c.blocked = false;
-        if (isNew) c.trusted = false;
         entry = c;
     }
     if (SaveContacts()) {
-        utils::LogSystem("Contact saved: " + (entry.nickname.empty() ? peerNodeId : entry.nickname) + " (" + peerNodeId + ")" + (entry.trusted ? "" : " [untrusted]"));
+        utils::LogSystem("Contact saved: " + (entry.nickname.empty() ? peerNodeId : entry.nickname) + " (" + peerNodeId + ")");
         return true;
     }
     return false;
@@ -488,19 +351,24 @@ bool P2PNode::AddContactFromInviteCode(const std::string& inviteCode) {
         utils::LogError("Cannot add yourself from invite code");
         return false;
     }
-
-    if (!StoreVerifiedPeerIdentity(entry.nodeId, entry.nickname, entry.publicKeyBlob, {}, true, true, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return false;
-    }
     {
         std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto it = contacts_.find(entry.nodeId);
-        if (it != contacts_.end()) {
-            it->second.trusted = true;
-            it->second.blocked = false;
-            if (it->second.addedAtUnix == 0) it->second.addedAtUnix = entry.addedAtUnix;
+        auto& c = contacts_[entry.nodeId];
+        if (c.nodeId.empty()) c = entry;
+        else {
+            if (!entry.nickname.empty()) c.nickname = entry.nickname;
+            if (!entry.publicKeyBlob.empty()) {
+                c.publicKeyBlob = entry.publicKeyBlob;
+                c.fingerprint = ComputeFingerprint(c.publicKeyBlob);
+            }
+            c.trusted = true;
+            c.blocked = false;
+            if (c.addedAtUnix == 0) c.addedAtUnix = entry.addedAtUnix;
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        publicKeys_[entry.nodeId] = entry.publicKeyBlob;
     }
     if (!SaveContacts()) return false;
     utils::LogSystem("Invite imported: " + entry.nickname + " (" + entry.nodeId + ")");
@@ -529,14 +397,7 @@ void P2PNode::PrintContacts() const {
             std::cout << " last seen " << secs << "s ago";
         }
         std::cout << (c.trusted ? " trusted" : " untrusted");
-        if (c.blocked) std::cout << " BLOCKED";
-        if (c.keyMismatch) {
-            std::cout << " MISMATCH";
-            if (!c.pendingFingerprint.empty()) std::cout << " pending_fp=" << c.pendingFingerprint;
-        }
         if (!c.fingerprint.empty()) std::cout << " fp=" << c.fingerprint;
-        if (!c.previousFingerprint.empty()) std::cout << " prev_fp=" << c.previousFingerprint;
-        if (c.lastIdentityMigrationUnix != 0) std::cout << " migrated_at=" << c.lastIdentityMigrationUnix;
         std::cout << '\n';
     }
     if (contacts.empty()) std::cout << "(empty)\n";
@@ -557,16 +418,8 @@ bool P2PNode::TrustContactByIndex(int index) {
         contact = ordered[static_cast<std::size_t>(index - 1)];
         auto it = contacts_.find(contact.nodeId);
         if (it != contacts_.end()) {
-            if (it->second.blocked) {
-                utils::LogError("Cannot trust a blocked contact; unblock first");
-                return false;
-            }
-            if (it->second.publicKeyBlob.empty()) {
-                utils::LogError("Cannot trust contact without a pinned public key/fingerprint yet");
-                return false;
-            }
             it->second.trusted = true;
-            if (it->second.fingerprint.empty()) {
+            if (it->second.fingerprint.empty() && !it->second.publicKeyBlob.empty()) {
                 it->second.fingerprint = ComputeFingerprint(it->second.publicKeyBlob);
             }
         }
@@ -588,131 +441,6 @@ bool P2PNode::UntrustContactByIndex(int index) {
     }
     if (!SaveContacts()) return false;
     utils::LogSystem("Contact marked untrusted: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::BlockContactByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-        auto it = contacts_.find(contact.nodeId);
-        if (it == contacts_.end()) return false;
-        it->second.blocked = true;
-        it->second.trusted = false;
-        it->second.keyMismatch = false;
-        it->second.pendingPublicKeyBlob.clear();
-        it->second.pendingEncryptPublicKeyBlob.clear();
-        it->second.pendingFingerprint.clear();
-    }
-    DropInvitesForPeer(contact.nodeId);
-    ResetSessionForPeer(contact.nodeId, "contact blocked", PrivateSessionState::Closed);
-    if (!SaveContacts()) return false;
-    utils::LogSystem("Contact blocked: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::UnblockContactByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-        auto it = contacts_.find(contact.nodeId);
-        if (it == contacts_.end()) return false;
-        it->second.blocked = false;
-    }
-    if (!SaveContacts()) return false;
-    utils::LogSystem("Contact unblocked (still untrusted until /trust): " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::RePinContactByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-    }
-    std::string error;
-    if (!ClearContactKeyMismatch(contact.nodeId, true, true, false, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return false;
-    }
-    utils::LogSystem("Contact key re-pinned: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::DistrustMismatchByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-    }
-    std::string error;
-    if (!ClearContactKeyMismatch(contact.nodeId, false, false, false, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return false;
-    }
-    utils::LogSystem("Pending mismatched key rejected; contact is now untrusted: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::ApproveIdentityMigrationByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-    }
-    std::string error;
-    if (!ClearContactKeyMismatch(contact.nodeId, true, true, true, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return false;
-    }
-    utils::LogSystem("Identity migration approved for replacement device: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::ResetSessionByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-    }
-    if (!ResetSessionForPeer(contact.nodeId, "session reset requested", PrivateSessionState::AwaitingKey)) {
-        utils::LogError("No private session to reset for this contact");
-        return false;
-    }
-    utils::LogSystem("Private session reset for " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
-    return true;
-}
-
-bool P2PNode::RekeySessionByIndex(int index) {
-    ContactEntry contact{};
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto ordered = SortedContactsForDisplay(contacts_);
-        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
-        contact = ordered[static_cast<std::size_t>(index - 1)];
-    }
-
-    std::string error;
-    if (!CanInteractWithContact(contact.nodeId, true, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return false;
-    }
-    ResetSessionForPeer(contact.nodeId, "session rekey requested", PrivateSessionState::AwaitingKey);
-    SendInvite(contact.nodeId);
     return true;
 }
 
@@ -1071,31 +799,21 @@ bool P2PNode::FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& 
     if (!peer) return false;
     if (hello.nodeId == local_.nodeId) { SafeClosePeer(peer); return false; }
 
-    std::string trustError;
-    ByteVector verificationKey;
-    if (!GetVerificationPublicKeyForPeer(hello.nodeId, hello.publicKeyBlob, nullptr, verificationKey, &trustError)) {
-        if (!trustError.empty()) utils::LogError("Handshake rejected: " + trustError);
-        if (auto sid = FindSessionByPeer(hello.nodeId)) SetSessionState(hello.nodeId, *sid, PrivateSessionState::Mismatch, trustError);
-        SafeClosePeer(peer);
-        return false;
+    peer->SetRemoteIdentity(hello.nodeId, hello.nickname, hello.listenPort);
+
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        publicKeys_[hello.nodeId] = hello.publicKeyBlob;
     }
     {
         std::lock_guard<std::mutex> lock(contactsMutex_);
         auto it = contacts_.find(hello.nodeId);
-        if (it != contacts_.end() && it->second.blocked) {
-            const std::string displayName = !it->second.nickname.empty() ? it->second.nickname : (!hello.nickname.empty() ? hello.nickname : hello.nodeId);
-            utils::LogError("Handshake rejected from blocked contact: " + displayName);
-            SafeClosePeer(peer);
-            return false;
+        if (it != contacts_.end() && !hello.publicKeyBlob.empty()) {
+            it->second.publicKeyBlob = hello.publicKeyBlob;
+            it->second.fingerprint = ComputeFingerprint(hello.publicKeyBlob);
         }
     }
-    if (!hello.publicKeyBlob.empty()) {
-        std::lock_guard<std::mutex> lock(publicKeysMutex_);
-        auto cached = publicKeys_.find(hello.nodeId);
-        if (cached == publicKeys_.end()) publicKeys_[hello.nodeId] = hello.publicKeyBlob;
-    }
-
-    peer->SetRemoteIdentity(hello.nodeId, hello.nickname, hello.listenPort);
+    SaveContacts();
 
     if (!hello.observedIpForRemote.empty() && hello.observedPortForRemote != 0) {
         std::lock_guard<std::mutex> lock(observedEndpointMutex_);
@@ -1141,6 +859,15 @@ bool P2PNode::FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& 
     FlushRelayQueueForTarget(hello.nodeId);
     FlushRelayAckQueueForTarget(hello.nodeId);
     RequestHistorySync(hello.nodeId);
+    bool shouldMirrorDevice = false;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        auto it = overlayState_.devices.find(hello.nodeId);
+        shouldMirrorDevice = (it != overlayState_.devices.end() && it->second.approved && !it->second.revoked);
+    }
+    if (shouldMirrorDevice) {
+        MirrorConversationToDevice(hello.nodeId, 8);
+    }
     if (!wasKnown) BroadcastPeerListToAll();
     return true;
 }
@@ -1278,12 +1005,6 @@ ByteVector P2PNode::BuildHistorySyncResponseSignedData(const HistorySyncResponse
 }
 
 void P2PNode::SendInvite(const NodeId& targetNodeId) {
-    std::string error;
-    if (!CanInteractWithContact(targetNodeId, true, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return;
-    }
-
     InviteRequestPayload payload{};
     payload.inviteId = utils::GeneratePacketId();
     payload.fromNodeId = local_.nodeId;
@@ -1298,8 +1019,6 @@ void P2PNode::SendInvite(const NodeId& targetNodeId) {
         std::lock_guard<std::mutex> lock(invitesMutex_);
         outgoingInvites_[payload.inviteId] = inv;
     }
-    EnsureSessionForPeer(targetNodeId, ResolveDisplayName(targetNodeId), payload.inviteId);
-    SetSessionState(targetNodeId, payload.inviteId, PrivateSessionState::PendingOutgoingInvite);
 
     const PacketId packetId = utils::GeneratePacketId();
     router_.MarkSeen(packetId);
@@ -1314,18 +1033,19 @@ void P2PNode::HandleInviteRequest(const std::shared_ptr<PeerConnection>& peer, P
     InviteRequestPayload p{};
     if (!protocol::DeserializeInviteRequest(payload, p)) return;
 
-    std::string error;
     ByteVector pub;
-    if (!GetVerificationPublicKeyForPeer(p.fromNodeId, p.fromPublicKeyBlob, &p.fromEncryptPublicKeyBlob, pub, &error)) {
-        if (!error.empty()) utils::LogError("Invite rejected: " + error);
-        return;
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        auto it = publicKeys_.find(p.fromNodeId);
+        if (it != publicKeys_.end()) pub = it->second;
+        else if (!p.fromPublicKeyBlob.empty()) {
+            publicKeys_[p.fromNodeId] = p.fromPublicKeyBlob;
+            pub = p.fromPublicKeyBlob;
+        } else return;
+        if (!p.fromEncryptPublicKeyBlob.empty()) publicEncryptKeys_[p.fromNodeId] = p.fromEncryptPublicKeyBlob;
     }
     if (!signer_.Verify(BuildInviteRequestSignedData(p), p.signature, pub)) {
         utils::LogError("Invite signature invalid");
-        return;
-    }
-    if (!StoreVerifiedPeerIdentity(p.fromNodeId, p.fromNickname, p.fromPublicKeyBlob, p.fromEncryptPublicKeyBlob, true, false, &error)) {
-        if (!error.empty()) utils::LogError("Invite rejected: " + error);
         return;
     }
 
@@ -1335,9 +1055,15 @@ void P2PNode::HandleInviteRequest(const std::shared_ptr<PeerConnection>& peer, P
             std::lock_guard<std::mutex> lock(invitesMutex_);
             incomingInvites_[p.inviteId] = inv;
         }
-        EnsureSessionForPeer(p.fromNodeId, p.fromNickname, p.inviteId);
-        SetSessionState(p.fromNodeId, p.inviteId, PrivateSessionState::PendingIncomingInvite);
-        utils::LogSystem(p.fromNickname + " invites you to private chat (verify fingerprint, then /trust and /accept)");
+        {
+            std::lock_guard<std::mutex> lock(contactsMutex_);
+            auto it = contacts_.find(p.fromNodeId);
+            if (it != contacts_.end() && !p.fromPublicKeyBlob.empty()) {
+                it->second.publicKeyBlob = p.fromPublicKeyBlob;
+                it->second.fingerprint = ComputeFingerprint(p.fromPublicKeyBlob);
+            }
+        }
+        utils::LogSystem(p.fromNickname + " invites you to private chat");
         return;
     }
 
@@ -1346,12 +1072,6 @@ void P2PNode::HandleInviteRequest(const std::shared_ptr<PeerConnection>& peer, P
 }
 
 void P2PNode::AcceptInvite(const NodeId& fromNodeId) {
-    std::string error;
-    if (!CanInteractWithContact(fromNodeId, true, &error)) {
-        if (!error.empty()) utils::LogError(error + ". Trust and pin the contact first before accepting the invite.");
-        return;
-    }
-
     auto inviteOpt = FindIncomingInviteByFromNodeId(fromNodeId);
     if (!inviteOpt) { utils::LogError("No invite from this user"); return; }
     auto invite = *inviteOpt;
@@ -1390,7 +1110,6 @@ void P2PNode::AcceptInvite(const NodeId& fromNodeId) {
 
     EnsureSessionForPeer(invite.fromNodeId, invite.fromNickname, sessionId);
     SetSessionKeyForPeer(invite.fromNodeId, sessionId, sessionKey);
-    SetSessionState(invite.fromNodeId, payload.sessionId, PrivateSessionState::Active);
     {
         std::lock_guard<std::mutex> lock(invitesMutex_);
         incomingInvites_.erase(invite.inviteId);
@@ -1410,18 +1129,19 @@ void P2PNode::HandleInviteAccept(const std::shared_ptr<PeerConnection>& peer, Pa
     InviteAcceptPayload p{};
     if (!protocol::DeserializeInviteAccept(payload, p)) return;
 
-    std::string error;
     ByteVector pub;
-    if (!GetVerificationPublicKeyForPeer(p.fromNodeId, p.fromPublicKeyBlob, &p.fromEncryptPublicKeyBlob, pub, &error)) {
-        if (!error.empty()) utils::LogError("Invite accept rejected: " + error);
-        return;
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        auto it = publicKeys_.find(p.fromNodeId);
+        if (it != publicKeys_.end()) pub = it->second;
+        else if (!p.fromPublicKeyBlob.empty()) {
+            publicKeys_[p.fromNodeId] = p.fromPublicKeyBlob;
+            pub = p.fromPublicKeyBlob;
+        } else return;
+        if (!p.fromEncryptPublicKeyBlob.empty()) publicEncryptKeys_[p.fromNodeId] = p.fromEncryptPublicKeyBlob;
     }
     if (!signer_.Verify(BuildInviteAcceptSignedData(p), p.signature, pub)) {
         utils::LogError("Accept signature invalid");
-        return;
-    }
-    if (!StoreVerifiedPeerIdentity(p.fromNodeId, p.fromNickname, p.fromPublicKeyBlob, p.fromEncryptPublicKeyBlob, true, false, &error)) {
-        if (!error.empty()) utils::LogError("Invite accept rejected: " + error);
         return;
     }
 
@@ -1430,6 +1150,14 @@ void P2PNode::HandleInviteAccept(const std::shared_ptr<PeerConnection>& peer, Pa
             std::lock_guard<std::mutex> lock(invitesMutex_);
             outgoingInvites_.erase(p.inviteId);
         }
+        {
+            std::lock_guard<std::mutex> lock(contactsMutex_);
+            auto it = contacts_.find(p.fromNodeId);
+            if (it != contacts_.end() && !p.fromPublicKeyBlob.empty()) {
+                it->second.publicKeyBlob = p.fromPublicKeyBlob;
+                it->second.fingerprint = ComputeFingerprint(p.fromPublicKeyBlob);
+            }
+        }
         ByteVector sessionKey;
         if (!signer_.Decrypt(p.encryptedSessionKeyBlob, sessionKey)) {
             utils::LogError("Failed to decrypt private chat session key");
@@ -1437,7 +1165,6 @@ void P2PNode::HandleInviteAccept(const std::shared_ptr<PeerConnection>& peer, Pa
         }
         EnsureSessionForPeer(p.fromNodeId, p.fromNickname, p.sessionId);
         SetSessionKeyForPeer(p.fromNodeId, p.sessionId, sessionKey);
-        SetSessionState(p.fromNodeId, p.sessionId, PrivateSessionState::Active);
         utils::LogSystem("Private chat opened with " + p.fromNickname);
         PrintStoredConversation(p.fromNodeId, p.fromNickname);
         return;
@@ -1482,7 +1209,6 @@ void P2PNode::RejectInvite(const NodeId& fromNodeId, const std::string& reason) 
         std::lock_guard<std::mutex> lock(invitesMutex_);
         incomingInvites_.erase(invite.inviteId);
     }
-    SetSessionState(invite.fromNodeId, invite.inviteId, PrivateSessionState::Closed, "invite rejected");
 
     PacketId packetId = utils::GeneratePacketId();
     router_.MarkSeen(packetId);
@@ -1497,18 +1223,19 @@ void P2PNode::HandleInviteReject(const std::shared_ptr<PeerConnection>& peer, Pa
     InviteRejectPayload p{};
     if (!protocol::DeserializeInviteReject(payload, p)) return;
 
-    std::string error;
     ByteVector pub;
-    if (!GetVerificationPublicKeyForPeer(p.fromNodeId, p.fromPublicKeyBlob, &p.fromEncryptPublicKeyBlob, pub, &error)) {
-        if (!error.empty()) utils::LogError("Invite reject rejected: " + error);
-        return;
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        auto it = publicKeys_.find(p.fromNodeId);
+        if (it != publicKeys_.end()) pub = it->second;
+        else if (!p.fromPublicKeyBlob.empty()) {
+            publicKeys_[p.fromNodeId] = p.fromPublicKeyBlob;
+            pub = p.fromPublicKeyBlob;
+        } else return;
+        if (!p.fromEncryptPublicKeyBlob.empty()) publicEncryptKeys_[p.fromNodeId] = p.fromEncryptPublicKeyBlob;
     }
     if (!signer_.Verify(BuildInviteRejectSignedData(p), p.signature, pub)) {
         utils::LogError("Reject signature invalid");
-        return;
-    }
-    if (!StoreVerifiedPeerIdentity(p.fromNodeId, p.fromNickname, p.fromPublicKeyBlob, p.fromEncryptPublicKeyBlob, true, false, &error)) {
-        if (!error.empty()) utils::LogError("Invite reject rejected: " + error);
         return;
     }
 
@@ -1517,7 +1244,6 @@ void P2PNode::HandleInviteReject(const std::shared_ptr<PeerConnection>& peer, Pa
             std::lock_guard<std::mutex> lock(invitesMutex_);
             outgoingInvites_.erase(p.inviteId);
         }
-        SetSessionState(p.fromNodeId, p.inviteId, PrivateSessionState::Closed, "invite rejected by peer");
         utils::LogSystem(p.fromNickname + " rejected the invite");
         return;
     }
@@ -1527,12 +1253,6 @@ void P2PNode::HandleInviteReject(const std::shared_ptr<PeerConnection>& peer, Pa
 }
 
 void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& text) {
-    std::string error;
-    if (!CanInteractWithContact(targetNodeId, true, &error)) {
-        if (!error.empty()) utils::LogError(error);
-        return;
-    }
-
     auto sessionIdOpt = FindSessionByPeer(targetNodeId);
     if (!sessionIdOpt) { utils::LogError("No private session with this user"); return; }
 
@@ -1546,7 +1266,6 @@ void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& 
     payload.text = text;
     ByteVector sessionKey;
     if (!GetSessionKeyForPeer(targetNodeId, sessionKey)) {
-        SetSessionState(targetNodeId, *sessionIdOpt, PrivateSessionState::AwaitingKey, "missing session key");
         utils::LogError("No E2E session key for this private chat yet");
         return;
     }
@@ -1576,7 +1295,7 @@ void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& 
     } else if (!peerManager_.FindByNodeId(targetNodeId)) {
         utils::LogSystem("Private message sent through relay/offline queue");
     }
-    utils::LogPrivate(local_.nickname, text);
+    if (text.rfind("[[", 0) != 0) utils::LogPrivate(local_.nickname, text);
 }
 
 void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload) {
@@ -1584,12 +1303,6 @@ void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, 
 
     PrivateMessagePayload p{};
     if (!protocol::DeserializePrivateMessage(payload, p)) return;
-
-    std::string error;
-    if (!CanInteractWithContact(p.fromNodeId, true, &error)) {
-        if (!error.empty()) utils::LogError("Private message rejected: " + error);
-        return;
-    }
 
     ByteVector pub;
     {
@@ -1606,16 +1319,13 @@ void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, 
     if (p.toNodeId != local_.nodeId) return;
     ByteVector sessionKey;
     if (!GetSessionKeyForPeer(p.fromNodeId, sessionKey)) {
-        if (auto sid = FindSessionByPeer(p.fromNodeId)) SetSessionState(p.fromNodeId, *sid, PrivateSessionState::AwaitingKey, "missing session key for incoming message");
         utils::LogError("Missing E2E session key for incoming private message");
         return;
     }
     if (!DecryptPrivateMessagePayload(p, sessionKey)) {
-        SetSessionState(p.fromNodeId, p.sessionId, PrivateSessionState::Mismatch, "failed to decrypt private message");
         utils::LogError("Failed to decrypt private message");
         return;
     }
-    SetSessionState(p.fromNodeId, p.sessionId, PrivateSessionState::Active);
     BufferOrDeliverIncomingPrivateMessage(p, pub, 0, true);
 }
 
@@ -2306,8 +2016,9 @@ void P2PNode::DeliverOrderedIncomingPrivateMessage(const PrivateMessagePayload& 
     }
     EnsureSessionForPeer(payload.fromNodeId, payload.fromNickname, payload.sessionId);
     AppendStoredPrivateMessage(payload, StoredMessageDirection::Incoming, StoredMessageState::Delivered, signerPublicKeyBlob);
+    ProcessOverlayPrivateMessage(payload);
     SendDeliveryAck(payload, ackedRelayPacketId);
-    if (logMessage) utils::LogPrivate(payload.fromNickname, payload.text);
+    if (logMessage && payload.text.rfind("[[", 0) != 0) utils::LogPrivate(payload.fromNickname, payload.text);
 }
 
 void P2PNode::BufferOrDeliverIncomingPrivateMessage(const PrivateMessagePayload& payload, const ByteVector& signerPublicKeyBlob, PacketId ackedRelayPacketId, bool logMessage) {
@@ -2400,195 +2111,18 @@ bool P2PNode::UpdateStoredMessageState(const NodeId& peerNodeId, MessageId messa
     return true;
 }
 
-
-void P2PNode::MarkContactKeyMismatch(const NodeId& peerNodeId, const ByteVector& advertisedPublicKey, const ByteVector* advertisedEncryptPublicKey, const std::string& nicknameHint) {
-    if (peerNodeId.empty() || advertisedPublicKey.empty()) return;
-    ContactEntry snapshot{};
-    bool changed = false;
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto& c = contacts_[peerNodeId];
-        if (c.nodeId.empty()) {
-            c.nodeId = peerNodeId;
-            c.nickname = nicknameHint;
-            c.trusted = false;
-            c.addedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
-            changed = true;
-        }
-        if (c.nickname.empty() && !nicknameHint.empty()) {
-            c.nickname = nicknameHint;
-            changed = true;
-        }
-        const std::string newFp = ComputeFingerprint(advertisedPublicKey);
-        if (!c.keyMismatch || c.pendingPublicKeyBlob != advertisedPublicKey || c.pendingFingerprint != newFp) {
-            c.keyMismatch = true;
-            c.pendingPublicKeyBlob = advertisedPublicKey;
-            c.pendingFingerprint = newFp;
-            if (advertisedEncryptPublicKey && !advertisedEncryptPublicKey->empty()) {
-                c.pendingEncryptPublicKeyBlob = *advertisedEncryptPublicKey;
-            }
-            c.trusted = false;
-            changed = true;
-        }
-        snapshot = c;
-    }
-    if (changed) {
-        SaveContacts();
-        utils::LogError("Fingerprint mismatch detected for " + ResolveDisplayName(peerNodeId, nicknameHint.empty() ? peerNodeId : nicknameHint) +
-                        ". New fingerprint=" + snapshot.pendingFingerprint +
-                        ". If this is a replacement device, use /migrate <contact-index>. Otherwise use /distrustmismatch <contact-index> or /block <contact-index>. For a same-identity re-pin use /repin <contact-index>.");
-    }
-}
-
-bool P2PNode::ClearContactKeyMismatch(const NodeId& peerNodeId, bool adoptPendingKey, bool trustAfterAdopt, bool markMigration, std::string* error) {
-    bool changed = false;
-    ByteVector adoptedKey;
-    ByteVector adoptedEncryptKey;
-    std::string reason;
-    {
-        std::lock_guard<std::mutex> lock(contactsMutex_);
-        auto it = contacts_.find(peerNodeId);
-        if (it == contacts_.end()) {
-            if (error) *error = "Contact not found for pending mismatch flow: " + peerNodeId;
-            return false;
-        }
-        auto& c = it->second;
-        if (!c.keyMismatch && c.pendingPublicKeyBlob.empty()) {
-            if (error) *error = "Contact has no pending key mismatch: " + ResolveDisplayName(peerNodeId, c.nickname);
-            return false;
-        }
-        const std::string oldFingerprint = c.fingerprint;
-        if (adoptPendingKey) {
-            if (c.pendingPublicKeyBlob.empty()) {
-                if (error) *error = "No pending public key available";
-                return false;
-            }
-            c.previousFingerprint = oldFingerprint;
-            c.publicKeyBlob = c.pendingPublicKeyBlob;
-            c.fingerprint = c.pendingFingerprint.empty() ? ComputeFingerprint(c.pendingPublicKeyBlob) : c.pendingFingerprint;
-            if (!c.pendingEncryptPublicKeyBlob.empty()) {
-                c.encryptPublicKeyBlob = c.pendingEncryptPublicKeyBlob;
-                adoptedEncryptKey = c.encryptPublicKeyBlob;
-            }
-            c.trusted = trustAfterAdopt;
-            adoptedKey = c.publicKeyBlob;
-            if (markMigration) {
-                c.lastIdentityMigrationUnix = static_cast<std::int64_t>(std::time(nullptr));
-                reason = "identity migrated to replacement device; rekey required";
-            } else {
-                reason = "identity re-pinned; rekey required";
-            }
-        } else {
-            c.trusted = false;
-            reason = "pending mismatched identity rejected";
-        }
-        c.keyMismatch = false;
-        c.pendingPublicKeyBlob.clear();
-        c.pendingEncryptPublicKeyBlob.clear();
-        c.pendingFingerprint.clear();
-        changed = true;
-    }
-    if (changed) {
-        {
-            std::lock_guard<std::mutex> lock(publicKeysMutex_);
-            if (!adoptedKey.empty()) publicKeys_[peerNodeId] = adoptedKey;
-            if (adoptPendingKey) {
-                if (!adoptedEncryptKey.empty()) publicEncryptKeys_[peerNodeId] = adoptedEncryptKey;
-                else publicEncryptKeys_.erase(peerNodeId);
-            }
-        }
-        SaveContacts();
-        DropInvitesForPeer(peerNodeId);
-        ResetSessionForPeer(peerNodeId, reason, adoptPendingKey ? PrivateSessionState::AwaitingKey : PrivateSessionState::Closed);
-        return true;
-    }
-    return false;
-}
-
-void P2PNode::DropInvitesForPeer(const NodeId& peerNodeId) {
-    std::lock_guard<std::mutex> lock(invitesMutex_);
-    for (auto it = incomingInvites_.begin(); it != incomingInvites_.end();) {
-        if (it->second.fromNodeId == peerNodeId || it->second.toNodeId == peerNodeId) it = incomingInvites_.erase(it);
-        else ++it;
-    }
-    for (auto it = outgoingInvites_.begin(); it != outgoingInvites_.end();) {
-        if (it->second.fromNodeId == peerNodeId || it->second.toNodeId == peerNodeId) it = outgoingInvites_.erase(it);
-        else ++it;
-    }
-}
-
-bool P2PNode::ResetSessionForPeer(const NodeId& peerNodeId, const std::string& reason, PrivateSessionState newState) {
-    bool updated = false;
-    {
-        std::lock_guard<std::mutex> lock(sessionsMutex_);
-        auto it = sessionByPeer_.find(peerNodeId);
-        if (it != sessionByPeer_.end()) {
-            auto sit = sessionsById_.find(it->second);
-            if (sit != sessionsById_.end()) {
-                sit->second.sessionKey.clear();
-                sit->second.active = false;
-                sit->second.state = newState;
-                sit->second.lastError = reason;
-                sit->second.stateUpdatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
-                updated = true;
-            }
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(sequenceMutex_);
-        nextOutgoingSequenceByPeer_.erase(peerNodeId);
-        expectedIncomingSequenceByPeer_.erase(peerNodeId);
-        reorderBufferByPeer_.erase(peerNodeId);
-    }
-    return updated;
-}
-
-std::string P2PNode::DescribeSessionState(const PrivateSession& session) const {
-    switch (session.state) {
-        case PrivateSessionState::PendingOutgoingInvite: return "pending-outgoing-invite";
-        case PrivateSessionState::PendingIncomingInvite: return "pending-incoming-invite";
-        case PrivateSessionState::AwaitingKey: return "awaiting-key";
-        case PrivateSessionState::Active: return session.active ? "active" : "active-offline";
-        case PrivateSessionState::Mismatch: return "mismatch";
-        case PrivateSessionState::Closed: return "closed";
-        default: return "unknown";
-    }
-}
-
-void P2PNode::SetSessionState(const NodeId& peerNodeId, SessionId sessionId, PrivateSessionState state, const std::string& error) {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = sessionByPeer_.find(peerNodeId);
-    if (it == sessionByPeer_.end()) {
-        sessionsById_[sessionId] = {sessionId, peerNodeId, ResolveDisplayName(peerNodeId), {}, state == PrivateSessionState::Active, state, error, static_cast<std::int64_t>(std::time(nullptr))};
-        sessionByPeer_[peerNodeId] = sessionId;
-        return;
-    }
-    auto sit = sessionsById_.find(it->second);
-    if (sit == sessionsById_.end()) {
-        sessionsById_[sessionId] = {sessionId, peerNodeId, ResolveDisplayName(peerNodeId), {}, state == PrivateSessionState::Active, state, error, static_cast<std::int64_t>(std::time(nullptr))};
-        sessionByPeer_[peerNodeId] = sessionId;
-        return;
-    }
-    sit->second.sessionId = sessionId;
-    sit->second.state = state;
-    sit->second.active = (state == PrivateSessionState::Active);
-    sit->second.lastError = error;
-    sit->second.stateUpdatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
-}
-
 void P2PNode::EnsureSessionForPeer(const NodeId& peerNodeId, const std::string& peerNickname, SessionId sessionId) {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
     auto existing = sessionByPeer_.find(peerNodeId);
     if (existing != sessionByPeer_.end()) {
         auto sit = sessionsById_.find(existing->second);
         if (sit != sessionsById_.end()) {
+            sit->second.active = true;
             if (!peerNickname.empty()) sit->second.peerNickname = peerNickname;
-            if (sit->second.sessionId != sessionId) sit->second.sessionId = sessionId;
-            if (sit->second.stateUpdatedAtUnix == 0) sit->second.stateUpdatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
             return;
         }
     }
-    sessionsById_[sessionId] = {sessionId, peerNodeId, peerNickname, {}, false, PrivateSessionState::AwaitingKey, "", static_cast<std::int64_t>(std::time(nullptr))};
+    sessionsById_[sessionId] = {sessionId, peerNodeId, peerNickname, {}, true};
     sessionByPeer_[peerNodeId] = sessionId;
 }
 
@@ -2600,14 +2134,10 @@ bool P2PNode::SetSessionKeyForPeer(const NodeId& peerNodeId, SessionId sessionId
         if (sit != sessionsById_.end()) {
             sit->second.sessionKey = sessionKey;
             sit->second.sessionId = sessionId;
-            sit->second.state = PrivateSessionState::Active;
-            sit->second.active = true;
-            sit->second.lastError.clear();
-            sit->second.stateUpdatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
             return true;
         }
     }
-    sessionsById_[sessionId] = {sessionId, peerNodeId, std::string(), sessionKey, true, PrivateSessionState::Active, "", static_cast<std::int64_t>(std::time(nullptr))};
+    sessionsById_[sessionId] = {sessionId, peerNodeId, std::string(), sessionKey, true};
     sessionByPeer_[peerNodeId] = sessionId;
     return true;
 }
@@ -2777,6 +2307,34 @@ bool P2PNode::DeleteConversationHistory(const NodeId& peerNodeId) {
     return true;
 }
 
+bool P2PNode::CheckConversationHistory(const NodeId& peerNodeId) {
+    if (peerNodeId.empty() || peerNodeId == local_.nodeId) {
+        utils::LogError("Invalid chat target for check");
+        return false;
+    }
+    std::string error;
+    if (!ConversationStore::CheckConversation(historyRootDir_, local_.nodeId, peerNodeId, signer_, &error)) {
+        utils::LogError("History check failed: " + error);
+        return false;
+    }
+    utils::LogSystem("History OK for peer " + peerNodeId);
+    return true;
+}
+
+bool P2PNode::RepairConversationHistory(const NodeId& peerNodeId) {
+    if (peerNodeId.empty() || peerNodeId == local_.nodeId) {
+        utils::LogError("Invalid chat target for repair");
+        return false;
+    }
+    std::string error;
+    if (!ConversationStore::RepairConversation(historyRootDir_, local_.nodeId, peerNodeId, signer_, localPublicKeyBlob_, &error)) {
+        utils::LogError("History repair failed: " + error);
+        return false;
+    }
+    utils::LogSystem("History repaired for peer " + peerNodeId);
+    return true;
+}
+
 void P2PNode::PrintKnownNodes() const {
     auto users = GetDisplayUsers();
     utils::LogRaw("=== Users ===");
@@ -2803,11 +2361,7 @@ void P2PNode::PrintSessions() const {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
     utils::LogRaw("=== Sessions ===");
     if (sessionsById_.empty()) utils::LogRaw("  (none)");
-    for (const auto& [id, s] : sessionsById_) {
-        std::string line = "  [" + std::to_string(id) + "] " + ResolveDisplayName(s.peerNodeId, s.peerNickname) + " id=" + s.peerNodeId + " state=" + DescribeSessionState(s);
-        if (!s.lastError.empty()) line += " error=\"" + s.lastError + "\"";
-        utils::LogRaw(line);
-    }
+    for (const auto& [id, s] : sessionsById_) utils::LogRaw("  [" + std::to_string(id) + "] " + ResolveDisplayName(s.peerNodeId, s.peerNickname) + " id=" + s.peerNodeId + (s.active ? " active" : " offline"));
 }
 
 void P2PNode::PrintInfo() const {
@@ -2833,6 +2387,11 @@ void P2PNode::PrintInfo() const {
         utils::LogRaw("Contacts: " + std::to_string(contacts_.size()));
     }
     {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        utils::LogRaw("Linked devices: " + std::to_string(overlayState_.devices.size()));
+        utils::LogRaw("Groups: " + std::to_string(overlayState_.groups.size()));
+    }
+    {
         std::lock_guard<std::mutex> lock(relayMutex_);
         std::size_t totalQueued = 0;
         for (const auto& [_, q] : relayQueuesByTarget_) totalQueued += q.size();
@@ -2842,6 +2401,880 @@ void P2PNode::PrintInfo() const {
         utils::LogRaw("Queued relay ACKs: " + std::to_string(totalQueuedAcks));
     }
     utils::LogRaw("========================================");
+}
+
+bool P2PNode::SaveOverlayState() const {
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    std::string error;
+    if (!p2p::SaveOverlayState(overlayRootDir_, local_.nodeId, overlayState_, &error)) {
+        if (!error.empty()) utils::LogError("Failed to save overlay state: " + error);
+        return false;
+    }
+    return true;
+}
+
+void P2PNode::LoadOverlayState() {
+    OverlayState loaded;
+    std::string error;
+    if (!p2p::LoadOverlayState(overlayRootDir_, local_.nodeId, loaded, &error)) {
+        if (!error.empty()) utils::LogError("Failed to load overlay state: " + error);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    overlayState_ = std::move(loaded);
+}
+
+std::vector<ContactEntry> P2PNode::GetSortedContacts() const {
+    std::lock_guard<std::mutex> lock(contactsMutex_);
+    return SortedContactsForDisplay(contacts_);
+}
+
+std::vector<DeviceEntry> P2PNode::GetSortedDevices() const {
+    std::vector<DeviceEntry> out;
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    for (const auto& [_, d] : overlayState_.devices) out.push_back(d);
+    std::sort(out.begin(), out.end(), [](const DeviceEntry& a, const DeviceEntry& b) {
+        return a.nickname == b.nickname ? a.nodeId < b.nodeId : a.nickname < b.nickname;
+    });
+    return out;
+}
+
+std::vector<GroupEntry> P2PNode::GetSortedGroups() const {
+    std::vector<GroupEntry> out;
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    for (const auto& [_, g] : overlayState_.groups) out.push_back(g);
+    std::sort(out.begin(), out.end(), [](const GroupEntry& a, const GroupEntry& b) {
+        return a.name == b.name ? a.groupId < b.groupId : a.name < b.name;
+    });
+    return out;
+}
+
+void P2PNode::PrintDevices() const {
+    utils::LogRaw("=== Devices ===");
+    auto devices = GetSortedDevices();
+    if (devices.empty()) { utils::LogRaw("  (none)"); return; }
+    int i = 1;
+    for (const auto& d : devices) {
+        std::string flags;
+        if (d.approved) flags += " approved";
+        if (d.revoked) flags += " revoked";
+        utils::LogRaw("[" + std::to_string(i++) + "] " + (d.nickname.empty() ? d.nodeId : d.nickname) +
+                      " id=" + d.nodeId + " label=" + d.label + flags);
+    }
+}
+
+void P2PNode::PrintGroups() const {
+    utils::LogRaw("=== Groups ===");
+    auto groups = GetSortedGroups();
+    if (groups.empty()) { utils::LogRaw("  (none)"); return; }
+    int i = 1;
+    for (const auto& g : groups) {
+        utils::LogRaw("[" + std::to_string(i++) + "] " + g.name + " id=" + g.groupId +
+                      " owner=" + g.ownerNodeId + " version=" + std::to_string(g.version) +
+                      " members=" + std::to_string(g.members.size()));
+        for (const auto& m : g.members) {
+            utils::LogRaw("    - " + (m.nickname.empty() ? m.nodeId : m.nickname) + " (" + ToString(m.role) + ")");
+        }
+    }
+}
+
+bool P2PNode::LinkDeviceByContactIndex(int index, const std::string& label) {
+    auto contacts = GetSortedContacts();
+    if (index <= 0 || static_cast<std::size_t>(index) > contacts.size()) return false;
+    const auto& c = contacts[static_cast<std::size_t>(index - 1)];
+    if (!c.trusted || c.blocked) {
+        utils::LogError("Device link requires trusted non-blocked contact");
+        return false;
+    }
+    auto sessionIdOpt = FindSessionByPeer(c.nodeId);
+    ByteVector sessionKey;
+    if (!sessionIdOpt || !GetSessionKeyForPeer(c.nodeId, sessionKey)) {
+        utils::LogError("No active E2E private session with this user");
+        return false;
+    }
+    DeviceEntry d{};
+    d.nodeId = c.nodeId; d.nickname = c.nickname; d.label = label.empty() ? c.nickname : label; d.fingerprint = c.fingerprint;
+    d.approved = true; d.revoked = false; d.linkedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+    SendPrivateMessage(d.nodeId, "[[DEVICE-LINK]]|" + local_.nodeId + "|" + local_.nickname + "|" + d.label + "|" + d.fingerprint);
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        overlayState_.devices[d.nodeId] = d;
+    }
+    SaveOverlayState();
+    MirrorConversationToDevice(d.nodeId, 16);
+    utils::LogSystem("Linked device: " + d.label);
+    return true;
+}
+
+bool P2PNode::RevokeDeviceByIndex(int index) {
+    auto devices = GetSortedDevices();
+    if (index <= 0 || static_cast<std::size_t>(index) > devices.size()) return false;
+    const auto nodeId = devices[static_cast<std::size_t>(index - 1)].nodeId;
+    auto sessionIdOpt = FindSessionByPeer(nodeId);
+    ByteVector sessionKey;
+    if (!sessionIdOpt || !GetSessionKeyForPeer(nodeId, sessionKey)) {
+        utils::LogError("No active E2E private session with this device");
+        return false;
+    }
+    SendPrivateMessage(nodeId, "[[DEVICE-REVOKE]]|" + local_.nodeId);
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        auto it = overlayState_.devices.find(nodeId);
+        if (it == overlayState_.devices.end()) return false;
+        it->second.revoked = true;
+        it->second.approved = false;
+        it->second.revokedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+    }
+    SaveOverlayState();
+    utils::LogSystem("Revoked device: " + nodeId);
+    return true;
+}
+
+bool P2PNode::CreateGroup(const std::string& name) {
+    if (name.empty()) return false;
+    GroupEntry g{};
+    g.groupId = utils::GenerateNodeId();
+    g.name = name;
+    g.ownerNodeId = local_.nodeId;
+    g.version = 1;
+    g.members.push_back(GroupMemberEntry{local_.nodeId, local_.nickname, GroupRole::Owner});
+    g.events.push_back(GroupEventEntry{1, "group_created", local_.nodeId, local_.nodeId, name, static_cast<std::int64_t>(std::time(nullptr))});
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        overlayState_.groups[g.groupId] = g;
+    }
+    SaveOverlayState();
+    utils::LogSystem("Group created: " + name);
+    return true;
+}
+
+std::string P2PNode::BuildGroupSyncText(const GroupEntry& group) const {
+    std::ostringstream oss;
+    oss << "[[GROUPSYNC]]|" << group.groupId << '|' << group.name << '|' << group.ownerNodeId << '|' << group.version;
+    for (const auto& m : group.members) {
+        oss << '|' << m.nodeId << ',' << m.nickname << ',' << ToString(m.role);
+    }
+    return oss.str();
+}
+
+void P2PNode::SendGroupSnapshotToMember(const GroupEntry& group, const GroupMemberEntry& member) {
+    if (member.nodeId == local_.nodeId) return;
+    SendPrivateMessage(member.nodeId, BuildGroupSyncText(group));
+}
+
+bool P2PNode::SyncGroupByIndex(int groupIndex) {
+    auto groups = GetSortedGroups();
+    if (groupIndex <= 0 || static_cast<std::size_t>(groupIndex) > groups.size()) return false;
+    auto group = groups[static_cast<std::size_t>(groupIndex - 1)];
+    for (const auto& m : group.members) SendGroupSnapshotToMember(group, m);
+    utils::LogSystem("Group snapshot synced: " + group.name);
+    return true;
+}
+
+bool P2PNode::AddGroupMember(int groupIndex, int contactIndex) {
+    auto groups = GetSortedGroups();
+    auto contacts = GetSortedContacts();
+    if (groupIndex <= 0 || static_cast<std::size_t>(groupIndex) > groups.size()) return false;
+    if (contactIndex <= 0 || static_cast<std::size_t>(contactIndex) > contacts.size()) return false;
+    const auto contact = contacts[static_cast<std::size_t>(contactIndex - 1)];
+    if (!contact.trusted || contact.blocked) { utils::LogError("Group membership requires trusted contact"); return false; }
+    GroupEntry updated;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        auto it = overlayState_.groups.find(groups[static_cast<std::size_t>(groupIndex - 1)].groupId);
+        if (it == overlayState_.groups.end()) return false;
+        if (it->second.ownerNodeId != local_.nodeId) { utils::LogError("Only local owner can change membership in this alpha build"); return false; }
+        for (const auto& m : it->second.members) if (m.nodeId == contact.nodeId) return false;
+        it->second.version += 1;
+        it->second.members.push_back(GroupMemberEntry{contact.nodeId, contact.nickname, GroupRole::Member});
+        it->second.events.push_back(GroupEventEntry{it->second.version, "member_added", local_.nodeId, contact.nodeId, contact.nickname, static_cast<std::int64_t>(std::time(nullptr))});
+        updated = it->second;
+    }
+    SaveOverlayState();
+    for (const auto& m : updated.members) SendGroupSnapshotToMember(updated, m);
+    utils::LogSystem("Group member added: " + contact.nickname);
+    return true;
+}
+
+bool P2PNode::RemoveGroupMember(int groupIndex, int contactIndex) {
+    auto groups = GetSortedGroups();
+    auto contacts = GetSortedContacts();
+    if (groupIndex <= 0 || static_cast<std::size_t>(groupIndex) > groups.size()) return false;
+    if (contactIndex <= 0 || static_cast<std::size_t>(contactIndex) > contacts.size()) return false;
+    const auto contact = contacts[static_cast<std::size_t>(contactIndex - 1)];
+    GroupEntry updated;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        auto it = overlayState_.groups.find(groups[static_cast<std::size_t>(groupIndex - 1)].groupId);
+        if (it == overlayState_.groups.end()) return false;
+        if (it->second.ownerNodeId != local_.nodeId) { utils::LogError("Only local owner can remove members in this alpha build"); return false; }
+        auto& members = it->second.members;
+        auto rem = std::remove_if(members.begin(), members.end(), [&](const GroupMemberEntry& m){ return m.nodeId == contact.nodeId; });
+        if (rem == members.end()) return false;
+        members.erase(rem, members.end());
+        it->second.version += 1;
+        it->second.events.push_back(GroupEventEntry{it->second.version, "member_removed", local_.nodeId, contact.nodeId, contact.nickname, static_cast<std::int64_t>(std::time(nullptr))});
+        updated = it->second;
+    }
+    SaveOverlayState();
+    for (const auto& m : updated.members) SendGroupSnapshotToMember(updated, m);
+    SendPrivateMessage(contact.nodeId, BuildGroupSyncText(updated));
+    utils::LogSystem("Group member removed: " + contact.nickname);
+    return true;
+}
+
+bool P2PNode::ChangeGroupRole(int groupIndex, int contactIndex, const std::string& roleText) {
+    auto roleOpt = ParseGroupRole(roleText);
+    if (!roleOpt) return false;
+    auto groups = GetSortedGroups();
+    auto contacts = GetSortedContacts();
+    if (groupIndex <= 0 || static_cast<std::size_t>(groupIndex) > groups.size()) return false;
+    if (contactIndex <= 0 || static_cast<std::size_t>(contactIndex) > contacts.size()) return false;
+    const auto contact = contacts[static_cast<std::size_t>(contactIndex - 1)];
+    GroupEntry updated;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        auto it = overlayState_.groups.find(groups[static_cast<std::size_t>(groupIndex - 1)].groupId);
+        if (it == overlayState_.groups.end()) return false;
+        if (it->second.ownerNodeId != local_.nodeId) { utils::LogError("Only owner can change roles"); return false; }
+        bool found = false;
+        for (auto& m : it->second.members) {
+            if (m.nodeId == contact.nodeId) { m.role = *roleOpt; found = true; break; }
+        }
+        if (!found) return false;
+        it->second.version += 1;
+        it->second.events.push_back(GroupEventEntry{it->second.version, "role_changed", local_.nodeId, contact.nodeId, roleText, static_cast<std::int64_t>(std::time(nullptr))});
+        updated = it->second;
+    }
+    SaveOverlayState();
+    for (const auto& m : updated.members) SendGroupSnapshotToMember(updated, m);
+    return true;
+}
+
+bool P2PNode::SendGroupMessageByIndex(int groupIndex, const std::string& text) {
+    auto groups = GetSortedGroups();
+    if (groupIndex <= 0 || static_cast<std::size_t>(groupIndex) > groups.size()) return false;
+    const auto& g = groups[static_cast<std::size_t>(groupIndex - 1)];
+    for (const auto& m : g.members) {
+        if (m.nodeId == local_.nodeId) continue;
+        SendPrivateMessage(m.nodeId, "[[GROUPMSG]]|" + g.groupId + "|" + g.name + "|" + local_.nickname + "|" + text);
+    }
+    utils::LogSystem("Group message fan-out sent to " + std::to_string(g.members.size() > 0 ? g.members.size()-1 : 0) + " recipient(s)");
+    return true;
+}
+
+bool P2PNode::SendFileOfferToPeer(const NodeId& targetNodeId, const std::string& displayName, const std::filesystem::path& srcPath, const std::string& groupId, const std::string& groupName) {
+    auto contactOpt = FindContact(targetNodeId);
+    if (!contactOpt || !contactOpt->trusted || contactOpt->blocked) {
+        utils::LogError("File send requires trusted non-blocked contact");
+        return false;
+    }
+    auto sessionIdOpt = FindSessionByPeer(targetNodeId);
+    ByteVector sessionKey;
+    if (!sessionIdOpt || !GetSessionKeyForPeer(targetNodeId, sessionKey)) {
+        utils::LogError("No E2E session key for this private chat yet");
+        return false;
+    }
+    std::error_code ec;
+    if (!fs::exists(srcPath, ec) || !fs::is_regular_file(srcPath, ec)) {
+        utils::LogError("Attachment source file not found");
+        return false;
+    }
+    const auto size = static_cast<std::uint64_t>(fs::file_size(srcPath, ec));
+    if (ec) {
+        utils::LogError("Failed to read attachment size");
+        return false;
+    }
+    if (size == 0) {
+        utils::LogError("Empty files are not supported");
+        return false;
+    }
+    if (size > kInlineFileTransferLimit) {
+        utils::LogError("File is too large for current alpha transfer layer (limit 256 KB)");
+        return false;
+    }
+    std::ifstream in(srcPath, std::ios::binary);
+    if (!in) {
+        utils::LogError("Failed to open attachment source file");
+        return false;
+    }
+    ByteVector bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.size() != size) {
+        utils::LogError("Failed to read full attachment payload");
+        return false;
+    }
+    OutgoingFileTransfer transfer{};
+    transfer.transferId = utils::GenerateNodeId();
+    transfer.targetNodeId = targetNodeId;
+    transfer.targetNickname = displayName;
+    transfer.fileName = srcPath.filename().string();
+    transfer.fileSize = size;
+    transfer.groupId = groupId;
+    transfer.groupName = groupName;
+    transfer.bytes = std::move(bytes);
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        outgoingFileTransfers_[transfer.transferId] = transfer;
+        FileTransferStatus st{};
+        st.transferId = transfer.transferId;
+        st.peerNodeId = targetNodeId;
+        st.peerNickname = displayName;
+        st.fileName = transfer.fileName;
+        st.fileSize = transfer.fileSize;
+        st.state = FileTransferState::Offered;
+        st.incoming = false;
+        st.groupName = groupName;
+        st.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        fileTransferStatuses_[st.transferId] = st;
+    }
+    SendPrivateMessage(targetNodeId,
+        "[[FILEOFFER]]|" + transfer.transferId + "|" + transfer.fileName + "|" + std::to_string(transfer.fileSize) + "|" + transfer.groupId + "|" + transfer.groupName);
+    if (groupId.empty()) {
+        utils::LogSystem("File offer sent to " + displayName + ": " + transfer.fileName + " (use /downloads on receiver)");
+    } else {
+        utils::LogSystem("Group file offer sent to " + displayName + " for group " + groupName + ": " + transfer.fileName);
+    }
+    return true;
+}
+
+bool P2PNode::SendAttachmentByContactIndex(int contactIndex, const std::string& pathText) {
+    auto contacts = GetSortedContacts();
+    if (contactIndex <= 0 || static_cast<std::size_t>(contactIndex) > contacts.size()) return false;
+    const auto& contact = contacts[static_cast<std::size_t>(contactIndex - 1)];
+    return SendFileOfferToPeer(contact.nodeId, contact.nickname.empty() ? contact.nodeId : contact.nickname, fs::path(pathText));
+}
+
+bool P2PNode::SendGroupAttachmentByIndex(int groupIndex, const std::string& pathText) {
+    auto groups = GetSortedGroups();
+    if (groupIndex <= 0 || static_cast<std::size_t>(groupIndex) > groups.size()) return false;
+    const auto& g = groups[static_cast<std::size_t>(groupIndex - 1)];
+    bool any = false;
+    for (const auto& m : g.members) {
+        if (m.nodeId == local_.nodeId) continue;
+        if (SendFileOfferToPeer(m.nodeId, m.nickname.empty() ? m.nodeId : m.nickname, fs::path(pathText), g.groupId, g.name)) {
+            any = true;
+        }
+    }
+    return any;
+}
+
+void P2PNode::PrintPendingFiles() const {
+    utils::LogRaw("=== Pending Files ===");
+    std::vector<IncomingFileOffer> items;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (const auto& [_, offer] : pendingIncomingFileOffers_) items.push_back(offer);
+    }
+    std::sort(items.begin(), items.end(), [](const IncomingFileOffer& a, const IncomingFileOffer& b) {
+        if (a.senderNickname != b.senderNickname) return a.senderNickname < b.senderNickname;
+        if (a.fileName != b.fileName) return a.fileName < b.fileName;
+        return a.transferId < b.transferId;
+    });
+    if (items.empty()) { utils::LogRaw("  (none)"); return; }
+    int i = 1;
+    for (const auto& offer : items) {
+        std::string extra;
+        if (!offer.groupName.empty()) extra = " group=" + offer.groupName;
+        if (offer.accepted) extra += " accepted";
+        utils::LogRaw("[" + std::to_string(i++) + "] from=" + (offer.senderNickname.empty() ? offer.senderNodeId : offer.senderNickname) +
+                      " file=" + offer.fileName + " size=" + std::to_string(offer.fileSize) + extra);
+    }
+}
+
+void P2PNode::PrintFileTransfers() const {
+    utils::LogRaw("=== File Transfers ===");
+    std::vector<FileTransferStatus> items;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (const auto& [_, st] : fileTransferStatuses_) items.push_back(st);
+    }
+    std::sort(items.begin(), items.end(), [](const FileTransferStatus& a, const FileTransferStatus& b) {
+        if (a.updatedAtUnix != b.updatedAtUnix) return a.updatedAtUnix > b.updatedAtUnix;
+        return a.transferId < b.transferId;
+    });
+    if (items.empty()) { utils::LogRaw("  (none)"); return; }
+    for (const auto& st : items) {
+        std::string line = "[" + st.transferId + "] " + (st.incoming ? "in" : "out") +
+            " peer=" + (st.peerNickname.empty() ? st.peerNodeId : st.peerNickname) +
+            " file=" + st.fileName +
+            " size=" + std::to_string(st.fileSize) +
+            " state=" + ToString(st.state);
+        if (st.totalChunks > 0) {
+            line += " chunks=" + std::to_string(st.currentChunk) + "/" + std::to_string(st.totalChunks);
+        }
+        if (!st.groupName.empty()) line += " group=" + st.groupName;
+        utils::LogRaw(line);
+    }
+}
+
+void P2PNode::PrintControlStates() const {
+    utils::LogRaw("=== Control States ===");
+    std::vector<std::pair<std::string, ControlFlowState>> items;
+    {
+        std::lock_guard<std::mutex> lock(controlStateMutex_);
+        for (const auto& kv : controlStates_) items.push_back(kv);
+    }
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (items.empty()) { utils::LogRaw("  (none)"); return; }
+    for (const auto& [k, st] : items) {
+        utils::LogRaw(k + " => " + ToString(st));
+    }
+}
+
+bool P2PNode::AcceptPendingFileByIndex(int index) {
+    if (index <= 0) return false;
+    std::vector<IncomingFileOffer> items;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (const auto& [_, offer] : pendingIncomingFileOffers_) items.push_back(offer);
+    }
+    std::sort(items.begin(), items.end(), [](const IncomingFileOffer& a, const IncomingFileOffer& b) {
+        if (a.senderNickname != b.senderNickname) return a.senderNickname < b.senderNickname;
+        if (a.fileName != b.fileName) return a.fileName < b.fileName;
+        return a.transferId < b.transferId;
+    });
+    if (static_cast<std::size_t>(index) > items.size()) return false;
+    const auto picked = items[static_cast<std::size_t>(index - 1)];
+    auto sessionIdOpt = FindSessionByPeer(picked.senderNodeId);
+    ByteVector sessionKey;
+    if (!sessionIdOpt || !GetSessionKeyForPeer(picked.senderNodeId, sessionKey)) {
+        utils::LogError("No E2E session key for this private chat yet");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto it = pendingIncomingFileOffers_.find(picked.transferId);
+        if (it == pendingIncomingFileOffers_.end()) return false;
+        it->second.accepted = true;
+        auto st = fileTransferStatuses_.find(picked.transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Accepted;
+            st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        }
+    }
+    SendPrivateMessage(picked.senderNodeId, "[[FILEACCEPT]]|" + picked.transferId);
+    utils::LogSystem("Accepted file download: " + picked.fileName);
+    return true;
+}
+
+bool P2PNode::RejectPendingFileByIndex(int index) {
+    if (index <= 0) return false;
+    std::vector<IncomingFileOffer> items;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (const auto& [_, offer] : pendingIncomingFileOffers_) items.push_back(offer);
+    }
+    std::sort(items.begin(), items.end(), [](const IncomingFileOffer& a, const IncomingFileOffer& b) {
+        if (a.senderNickname != b.senderNickname) return a.senderNickname < b.senderNickname;
+        if (a.fileName != b.fileName) return a.fileName < b.fileName;
+        return a.transferId < b.transferId;
+    });
+    if (static_cast<std::size_t>(index) > items.size()) return false;
+    const auto picked = items[static_cast<std::size_t>(index - 1)];
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        pendingIncomingFileOffers_.erase(picked.transferId);
+        incomingFileTransfers_.erase(picked.transferId);
+        auto st = fileTransferStatuses_.find(picked.transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Rejected;
+            st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        }
+    }
+    SendPrivateMessage(picked.senderNodeId, "[[FILEREJECT]]|" + picked.transferId);
+    utils::LogSystem("Rejected file: " + picked.fileName);
+    return true;
+}
+
+bool P2PNode::MirrorConversationToDevice(const NodeId& deviceNodeId, std::size_t maxMessages) {
+    if (deviceNodeId.empty() || maxMessages == 0) return false;
+    auto contacts = GetSortedContacts();
+    std::size_t mirrored = 0;
+    for (const auto& c : contacts) {
+        if (c.nodeId == deviceNodeId || c.nodeId == local_.nodeId) continue;
+        std::vector<StoredConversationMessage> messages;
+        std::string error;
+        if (!ConversationStore::LoadConversation(historyRootDir_, local_.nodeId, c.nodeId, signer_, messages, &error)) {
+            continue;
+        }
+        if (messages.size() > maxMessages) {
+            messages.erase(messages.begin(), messages.end() - static_cast<std::ptrdiff_t>(maxMessages));
+        }
+        for (const auto& m : messages) {
+            std::string sender = m.fromNickname.empty() ? m.fromNodeId : m.fromNickname;
+            std::string body = "[[DEVSYNC]]|" + c.nodeId + "|" + sender + "|" + m.text;
+            SendPrivateMessage(deviceNodeId, body);
+            ++mirrored;
+        }
+    }
+    if (mirrored > 0) {
+        utils::LogSystem("Mirrored " + std::to_string(mirrored) + " message(s) to linked device " + deviceNodeId);
+    }
+    return true;
+}
+
+bool P2PNode::SyncDeviceByIndex(int index) {
+    auto devices = GetSortedDevices();
+    if (index <= 0 || static_cast<std::size_t>(index) > devices.size()) return false;
+    const auto& d = devices[static_cast<std::size_t>(index - 1)];
+    if (!d.approved || d.revoked) {
+        utils::LogError("Device is not active for sync");
+        return false;
+    }
+    auto sessionIdOpt = FindSessionByPeer(d.nodeId);
+    ByteVector sessionKey;
+    if (!sessionIdOpt || !GetSessionKeyForPeer(d.nodeId, sessionKey)) {
+        utils::LogError("No E2E session key for linked device");
+        return false;
+    }
+    return MirrorConversationToDevice(d.nodeId, 16);
+}
+
+bool P2PNode::ApplyDeviceSyncText(const NodeId& senderNodeId, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.size() < 4 || parts[0] != "[[DEVSYNC]]") return false;
+    utils::LogSystem("Synced from device " + senderNodeId + " peer=" + parts[1] + " msg=" + parts[3]);
+    return true;
+}
+
+bool P2PNode::ApplyFileOfferText(const NodeId& senderNodeId, const std::string& senderNickname, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.size() < 4 || parts[0] != "[[FILEOFFER]]") return false;
+    IncomingFileOffer offer{};
+    offer.transferId = parts[1];
+    offer.senderNodeId = senderNodeId;
+    offer.senderNickname = senderNickname;
+    offer.fileName = parts[2];
+    try { offer.fileSize = static_cast<std::uint64_t>(std::stoull(parts[3])); } catch (...) { return false; }
+    if (parts.size() > 4) offer.groupId = parts[4];
+    if (parts.size() > 5) offer.groupName = parts[5];
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        pendingIncomingFileOffers_[offer.transferId] = offer;
+        incomingFileTransfers_.erase(offer.transferId);
+        FileTransferStatus st{};
+        st.transferId = offer.transferId;
+        st.peerNodeId = senderNodeId;
+        st.peerNickname = senderNickname;
+        st.fileName = offer.fileName;
+        st.fileSize = offer.fileSize;
+        st.state = FileTransferState::Offered;
+        st.incoming = true;
+        st.groupName = offer.groupName;
+        st.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        fileTransferStatuses_[st.transferId] = st;
+    }
+    std::string msg = "Incoming file offer from " + (senderNickname.empty() ? senderNodeId : senderNickname) + ": " + offer.fileName +
+                      " (" + std::to_string(offer.fileSize) + " bytes)";
+    if (!offer.groupName.empty()) msg += " in group " + offer.groupName;
+    msg += ". Use /downloads and /download <n> or /rejectfile <n>.";
+    utils::LogSystem(msg);
+    return true;
+}
+
+bool P2PNode::ApplyFileAcceptText(const NodeId& senderNodeId, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.size() < 2 || parts[0] != "[[FILEACCEPT]]") return false;
+    OutgoingFileTransfer transfer{};
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto it = outgoingFileTransfers_.find(parts[1]);
+        if (it == outgoingFileTransfers_.end()) return true;
+        transfer = it->second;
+    }
+    if (transfer.targetNodeId != senderNodeId) return true;
+    const std::size_t totalChunks = (transfer.bytes.size() + kFileChunkBytes - 1) / kFileChunkBytes;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto st = fileTransferStatuses_.find(transfer.transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Transferring;
+            st->second.totalChunks = totalChunks;
+            st->second.currentChunk = 0;
+            st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        }
+    }
+    for (std::size_t i = 0; i < totalChunks; ++i) {
+        const std::size_t off = i * kFileChunkBytes;
+        const std::size_t len = std::min(kFileChunkBytes, transfer.bytes.size() - off);
+        ByteVector chunk(transfer.bytes.begin() + static_cast<std::ptrdiff_t>(off), transfer.bytes.begin() + static_cast<std::ptrdiff_t>(off + len));
+        SendPrivateMessage(senderNodeId, "[[FILECHUNK]]|" + transfer.transferId + "|" + std::to_string(i + 1) + "|" + std::to_string(totalChunks) +
+            "|" + transfer.fileName + "|" + BytesToHexLocal(chunk));
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto st = fileTransferStatuses_.find(transfer.transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.currentChunk = i + 1;
+            st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        }
+    }
+    { std::lock_guard<std::mutex> lock(fileTransfersMutex_); outgoingFileTransfers_.erase(transfer.transferId); auto st=fileTransferStatuses_.find(transfer.transferId); if (st!=fileTransferStatuses_.end()) { st->second.state = FileTransferState::Completed; st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr)); } }
+    utils::LogSystem("File data sent: " + transfer.fileName + " to " + (transfer.targetNickname.empty() ? senderNodeId : transfer.targetNickname));
+    return true;
+}
+
+bool P2PNode::ApplyFileRejectText(const NodeId& senderNodeId, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.size() < 2 || parts[0] != "[[FILEREJECT]]") return false;
+    std::string fileName;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto it = outgoingFileTransfers_.find(parts[1]);
+        if (it != outgoingFileTransfers_.end()) {
+            fileName = it->second.fileName;
+            outgoingFileTransfers_.erase(it);
+        }
+        auto st = fileTransferStatuses_.find(parts[1]);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Rejected;
+            st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        }
+    }
+    if (!fileName.empty()) utils::LogSystem("File rejected by " + senderNodeId + ": " + fileName);
+    return true;
+}
+
+bool P2PNode::ApplyFileChunkText(const NodeId& senderNodeId, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.size() < 6 || parts[0] != "[[FILECHUNK]]") return false;
+    const auto transferId = parts[1];
+    std::size_t seq = 0, total = 0;
+    try {
+        seq = static_cast<std::size_t>(std::stoull(parts[2]));
+        total = static_cast<std::size_t>(std::stoull(parts[3]));
+    } catch (...) { return false; }
+    if (seq == 0 || total == 0 || seq > total) return false;
+    ByteVector chunk;
+    if (!HexToBytesLocal(parts[5], chunk)) return false;
+
+    IncomingFileOffer offer;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto itOffer = pendingIncomingFileOffers_.find(transferId);
+        if (itOffer == pendingIncomingFileOffers_.end() || !itOffer->second.accepted) return true;
+        offer = itOffer->second;
+        auto& transfer = incomingFileTransfers_[transferId];
+        if (transfer.offer.transferId.empty()) transfer.offer = offer;
+        if (transfer.totalChunks == 0) {
+            transfer.totalChunks = total;
+            transfer.chunks.resize(total);
+            transfer.received.assign(total, false);
+            transfer.receivedCount = 0;
+            auto st = fileTransferStatuses_.find(transferId);
+            if (st != fileTransferStatuses_.end()) {
+                st->second.state = FileTransferState::Transferring;
+                st->second.totalChunks = total;
+                st->second.currentChunk = 0;
+                st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+            }
+        }
+        if (transfer.totalChunks != total) return true;
+        const std::size_t idx = seq - 1;
+        if (!transfer.received[idx]) {
+            transfer.chunks[idx] = std::move(chunk);
+            transfer.received[idx] = true;
+            transfer.receivedCount += 1;
+            auto st = fileTransferStatuses_.find(transferId);
+            if (st != fileTransferStatuses_.end()) {
+                st->second.currentChunk = transfer.receivedCount;
+                st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+            }
+        }
+        if (transfer.receivedCount != transfer.totalChunks) return true;
+        ByteVector assembled;
+        assembled.reserve(static_cast<std::size_t>(offer.fileSize));
+        for (const auto& c : transfer.chunks) assembled.insert(assembled.end(), c.begin(), c.end());
+        fs::path dir = fs::path("downloads") / local_.nodeId / (offer.groupName.empty() ? senderNodeId : offer.groupName);
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        fs::path dst = dir / parts[4];
+        if (fs::exists(dst)) {
+            for (int n = 1; n < 1000; ++n) {
+                fs::path cand = dir / (dst.stem().string() + "_" + std::to_string(n) + dst.extension().string());
+                if (!fs::exists(cand)) { dst = cand; break; }
+            }
+        }
+        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            utils::LogError("Failed to write downloaded file: " + dst.string());
+            return true;
+        }
+        out.write(reinterpret_cast<const char*>(assembled.data()), static_cast<std::streamsize>(assembled.size()));
+        out.close();
+        pendingIncomingFileOffers_.erase(transferId);
+        incomingFileTransfers_.erase(transferId);
+        auto st = fileTransferStatuses_.find(transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Completed;
+            st->second.updatedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        }
+        utils::LogSystem("File saved: " + dst.string());
+    }
+    return true;
+}
+
+bool P2PNode::ApplyGroupSyncText(const NodeId& senderNodeId, const std::string& text) {
+
+    auto parts = SplitPipe(text);
+    if (parts.size() < 5 || parts[0] != "[[GROUPSYNC]]") return false;
+    GroupEntry incoming{};
+    incoming.groupId = parts[1]; incoming.name = parts[2]; incoming.ownerNodeId = parts[3]; incoming.version = 0;
+    try { incoming.version = std::stoull(parts[4]); } catch (...) { return false; }
+    if (incoming.ownerNodeId != senderNodeId) {
+        utils::LogError("Rejected group sync: sender is not owner");
+        return true;
+    }
+    for (std::size_t i = 5; i < parts.size(); ++i) {
+        std::stringstream ss(parts[i]);
+        std::string a,b,c;
+        if (!std::getline(ss,a,',')) continue; if (!std::getline(ss,b,',')) continue; if (!std::getline(ss,c,',')) continue;
+        incoming.members.push_back(GroupMemberEntry{a,b,ParseGroupRole(c).value_or(GroupRole::Member)});
+    }
+    bool containsLocal = false;
+    for (const auto& m : incoming.members) if (m.nodeId == local_.nodeId) { containsLocal = true; break; }
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        auto it = overlayState_.groups.find(incoming.groupId);
+        if (it != overlayState_.groups.end() && it->second.version > incoming.version) {
+            utils::LogSystem("Ignored stale group snapshot for " + incoming.name);
+            return true;
+        }
+        if (!containsLocal) { overlayState_.groups.erase(incoming.groupId); }
+        auto& target = overlayState_.groups[incoming.groupId];
+        target.groupId = incoming.groupId; target.name = incoming.name; target.ownerNodeId = incoming.ownerNodeId; target.version = incoming.version; target.members = incoming.members;
+        target.events.push_back(GroupEventEntry{incoming.version, "snapshot_applied", senderNodeId, local_.nodeId, incoming.name, static_cast<std::int64_t>(std::time(nullptr))});
+    }
+    SaveOverlayState();
+    utils::LogSystem("Applied group sync: " + incoming.name);
+    return true;
+}
+
+bool P2PNode::ApplyDeviceLinkText(const NodeId& senderNodeId, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.empty()) return false;
+    if (parts[0] == "[[DEVICE-LINK]]" && parts.size() >= 5) {
+        DeviceEntry d{}; d.nodeId = senderNodeId; d.nickname = parts[2]; d.label = parts[3]; d.fingerprint = parts[4]; d.approved = true; d.linkedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+        { std::lock_guard<std::mutex> lock(overlayMutex_); overlayState_.devices[d.nodeId] = d; }
+        SaveOverlayState();
+        utils::LogSystem("Linked remote device: " + d.label);
+        return true;
+    }
+    if (parts[0] == "[[DEVICE-REVOKE]]" && parts.size() >= 2) {
+        {
+            std::lock_guard<std::mutex> lock(overlayMutex_);
+            auto it = overlayState_.devices.find(senderNodeId);
+            if (it != overlayState_.devices.end()) {
+                it->second.revoked = true; it->second.approved = false; it->second.revokedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
+            }
+        }
+        SaveOverlayState();
+        utils::LogSystem("Remote device revoked: " + senderNodeId);
+        return true;
+    }
+    return false;
+}
+
+bool P2PNode::ApplyFileMetaText(const NodeId& senderNodeId, const std::string& text) {
+    auto parts = SplitPipe(text);
+    if (parts.size() < 6 || parts[0] != "[[FILEMETA]]") return false;
+    utils::LogSystem("Incoming attachment metadata from " + senderNodeId + ": " + parts[3] + " size=" + parts[4]);
+    return true;
+}
+
+P2PNode::ControlEnvelope P2PNode::ParseControlEnvelope(const PrivateMessagePayload& payload) const {
+    ControlEnvelope envelope{};
+    envelope.raw = payload.text;
+    envelope.senderNodeId = payload.fromNodeId;
+    envelope.senderNickname = payload.fromNickname;
+    if (payload.text.rfind("[[", 0) != 0) return envelope;
+    envelope.parts = SplitPipe(payload.text);
+    if (envelope.parts.empty()) return envelope;
+    const auto& tag = envelope.parts[0];
+    if (tag == "[[GROUPSYNC]]") envelope.kind = ControlMessageKind::GroupSync;
+    else if (tag == "[[DEVICE-LINK]]") envelope.kind = ControlMessageKind::DeviceLink;
+    else if (tag == "[[DEVICE-REVOKE]]") envelope.kind = ControlMessageKind::DeviceRevoke;
+    else if (tag == "[[DEVSYNC]]") envelope.kind = ControlMessageKind::DeviceSync;
+    else if (tag == "[[FILEMETA]]") envelope.kind = ControlMessageKind::FileMeta;
+    else if (tag == "[[FILEOFFER]]") envelope.kind = ControlMessageKind::FileOffer;
+    else if (tag == "[[FILEACCEPT]]") envelope.kind = ControlMessageKind::FileAccept;
+    else if (tag == "[[FILEREJECT]]") envelope.kind = ControlMessageKind::FileReject;
+    else if (tag == "[[FILECHUNK]]") envelope.kind = ControlMessageKind::FileChunk;
+    else if (tag == "[[GROUPMSG]]") envelope.kind = ControlMessageKind::GroupMessage;
+    return envelope;
+}
+
+std::string P2PNode::MakeControlStateKey(const ControlEnvelope& envelope) const {
+    std::string token;
+    if (envelope.parts.size() > 1) token = envelope.parts[1];
+    if (token.empty()) token = envelope.senderNodeId;
+    return ControlMessageKindToString(envelope.kind) + ":" + envelope.senderNodeId + ":" + token;
+}
+
+void P2PNode::UpdateControlState(const std::string& key, ControlFlowState state) {
+    std::lock_guard<std::mutex> lock(controlStateMutex_);
+    controlStates_[key] = state;
+}
+
+bool P2PNode::DispatchControlMessage(const ControlEnvelope& envelope) {
+    if (envelope.kind == ControlMessageKind::Unknown) return false;
+    const auto key = MakeControlStateKey(envelope);
+    UpdateControlState(key, ControlFlowState::Received);
+    bool handled = false;
+    switch (envelope.kind) {
+        case ControlMessageKind::GroupSync:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyGroupSyncText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::DeviceLink:
+        case ControlMessageKind::DeviceRevoke:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyDeviceLinkText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::DeviceSync:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyDeviceSyncText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::FileMeta:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyFileMetaText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::FileOffer:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyFileOfferText(envelope.senderNodeId, envelope.senderNickname, envelope.raw);
+            break;
+        case ControlMessageKind::FileAccept:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyFileAcceptText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::FileReject:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyFileRejectText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::FileChunk:
+            UpdateControlState(key, ControlFlowState::Parsed);
+            handled = ApplyFileChunkText(envelope.senderNodeId, envelope.raw);
+            break;
+        case ControlMessageKind::GroupMessage: {
+            UpdateControlState(key, ControlFlowState::Parsed);
+            auto parts = envelope.parts.empty() ? SplitPipe(envelope.raw) : envelope.parts;
+            if (parts.size() >= 5) {
+                utils::LogSystem("[Group " + parts[2] + "] " + parts[3] + ": " + parts[4]);
+                handled = true;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    UpdateControlState(key, handled ? ControlFlowState::Applied : ControlFlowState::Rejected);
+    return handled;
+}
+
+void P2PNode::ProcessOverlayPrivateMessage(const PrivateMessagePayload& payload) {
+    const auto envelope = ParseControlEnvelope(payload);
+    if (envelope.kind == ControlMessageKind::Unknown) return;
+    if (!DispatchControlMessage(envelope)) {
+        utils::LogError("Failed to dispatch control message: " + envelope.raw);
+    }
 }
 
 std::vector<DisplayInvite> P2PNode::GetDisplayInvites() const {

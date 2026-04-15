@@ -110,6 +110,19 @@ public:
                                    CryptoSigner& signer,
                                    const ByteVector& localPublicKeyBlob,
                                    std::string* error = nullptr);
+
+    static bool CheckConversation(const std::string& rootDir,
+                                  const NodeId& localNodeId,
+                                  const NodeId& peerNodeId,
+                                  CryptoSigner& signer,
+                                  std::string* error = nullptr);
+
+    static bool RepairConversation(const std::string& rootDir,
+                                   const NodeId& localNodeId,
+                                   const NodeId& peerNodeId,
+                                   CryptoSigner& signer,
+                                   const ByteVector& localPublicKeyBlob,
+                                   std::string* error = nullptr);
 };
 
 } // namespace p2p
