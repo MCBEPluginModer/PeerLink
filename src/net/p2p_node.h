@@ -2,13 +2,19 @@
 #include "core/contact_store.h"
 #include "core/conversation_store.h"
 #include "core/fingerprint_utils.h"
+#include "core/overlay_state.h"
 #include "core/types.h"
 #include "crypto/crypto_signer.h"
 #include "net/known_nodes.h"
 #include "net/peer_manager.h"
 #include "net/router.h"
 
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace p2p {
 
@@ -16,6 +22,48 @@ class PeerConnection;
 
 class P2PNode {
 public:
+
+enum class ControlMessageKind {
+    Unknown = 0,
+    GroupSync,
+    DeviceLink,
+    DeviceRevoke,
+    DeviceSync,
+    FileMeta,
+    FileOffer,
+    FileAccept,
+    FileReject,
+    FileChunk,
+    GroupMessage
+};
+
+enum class ControlFlowState {
+    Idle = 0,
+    Received,
+    Parsed,
+    Validated,
+    Applied,
+    Rejected,
+    Failed
+};
+
+enum class FileTransferState {
+    Offered = 0,
+    Accepted,
+    Transferring,
+    Completed,
+    Rejected,
+    Failed
+};
+
+struct ControlEnvelope {
+    ControlMessageKind kind = ControlMessageKind::Unknown;
+    std::vector<std::string> parts;
+    std::string raw;
+    NodeId senderNodeId;
+    std::string senderNickname;
+};
+
     P2PNode(std::string nickname, std::uint16_t listenPort);
     ~P2PNode();
 
@@ -31,6 +79,8 @@ public:
     void SendPrivateMessage(const NodeId& targetNodeId, const std::string& text);
     bool OpenPrivateChat(const NodeId& peerNodeId, const std::string& peerNickname = "");
     bool DeleteConversationHistory(const NodeId& peerNodeId);
+    bool CheckConversationHistory(const NodeId& peerNodeId);
+    bool RepairConversationHistory(const NodeId& peerNodeId);
     bool IsPeerConnected(const NodeId& peerNodeId) const;
 
     bool AddOrUpdateContact(const NodeId& peerNodeId, const std::string& nickname = "");
@@ -42,18 +92,29 @@ public:
     void PrintFingerprint() const;
     bool TrustContactByIndex(int index);
     bool UntrustContactByIndex(int index);
-    bool BlockContactByIndex(int index);
-    bool UnblockContactByIndex(int index);
-    bool RePinContactByIndex(int index);
-    bool DistrustMismatchByIndex(int index);
-    bool ApproveIdentityMigrationByIndex(int index);
-    bool ResetSessionByIndex(int index);
-    bool RekeySessionByIndex(int index);
 
     void PrintKnownNodes() const;
     void PrintInvites() const;
     void PrintSessions() const;
     void PrintInfo() const;
+    void PrintDevices() const;
+    void PrintGroups() const;
+    bool LinkDeviceByContactIndex(int index, const std::string& label = "");
+    bool RevokeDeviceByIndex(int index);
+    bool CreateGroup(const std::string& name);
+    bool AddGroupMember(int groupIndex, int contactIndex);
+    bool RemoveGroupMember(int groupIndex, int contactIndex);
+    bool ChangeGroupRole(int groupIndex, int contactIndex, const std::string& roleText);
+    bool SyncGroupByIndex(int groupIndex);
+    bool SendGroupMessageByIndex(int groupIndex, const std::string& text);
+    bool SendAttachmentByContactIndex(int contactIndex, const std::string& path);
+    bool SendGroupAttachmentByIndex(int groupIndex, const std::string& path);
+    void PrintPendingFiles() const;
+    void PrintFileTransfers() const;
+    void PrintControlStates() const;
+    bool AcceptPendingFileByIndex(int index);
+    bool RejectPendingFileByIndex(int index);
+    bool SyncDeviceByIndex(int index);
     std::vector<DisplayUser> GetDisplayUsers() const;
     std::vector<DisplayInvite> GetDisplayInvites() const;
 
@@ -112,9 +173,6 @@ private:
     std::optional<ContactEntry> FindContact(const NodeId& peerNodeId) const;
     std::string ResolveDisplayName(const NodeId& peerNodeId, const std::string& fallback = "") const;
     void UpsertContactHintsFromKnownNode(const KnownNode& node);
-    bool CanInteractWithContact(const NodeId& peerNodeId, bool requireTrusted, std::string* error = nullptr) const;
-    bool GetVerificationPublicKeyForPeer(const NodeId& peerNodeId, const ByteVector& advertisedPublicKey, const ByteVector* advertisedEncryptPublicKey, ByteVector& out, std::string* error = nullptr);
-    bool StoreVerifiedPeerIdentity(const NodeId& peerNodeId, const std::string& nickname, const ByteVector& verifiedPublicKey, const ByteVector& verifiedEncryptPublicKey, bool createIfMissing, bool trustNewContact, std::string* error = nullptr);
 
     ByteVector BuildInviteRequestSignedData(const InviteRequestPayload& p) const;
     ByteVector BuildInviteAcceptSignedData(const InviteAcceptPayload& p) const;
@@ -150,12 +208,6 @@ private:
     void RemoveQueuedRelayMessageByMessageId(const NodeId& targetNodeId, MessageId messageId);
     void RemoveQueuedRelayAckByMessageId(const NodeId& targetNodeId, MessageId messageId);
     void SendDeliveryAck(const PrivateMessagePayload& message, PacketId ackedRelayPacketId);
-    void SetSessionState(const NodeId& peerNodeId, SessionId sessionId, PrivateSessionState state, const std::string& error = "");
-    std::string DescribeSessionState(const PrivateSession& session) const;
-    void MarkContactKeyMismatch(const NodeId& peerNodeId, const ByteVector& advertisedPublicKey, const ByteVector* advertisedEncryptPublicKey = nullptr, const std::string& nicknameHint = "");
-    bool ClearContactKeyMismatch(const NodeId& peerNodeId, bool adoptPendingKey, bool trustAfterAdopt, bool markMigration, std::string* error = nullptr);
-    bool ResetSessionForPeer(const NodeId& peerNodeId, const std::string& reason, PrivateSessionState newState = PrivateSessionState::Closed);
-    void DropInvitesForPeer(const NodeId& peerNodeId);
     void EnsureSessionForPeer(const NodeId& peerNodeId, const std::string& peerNickname, SessionId sessionId);
     bool SetSessionKeyForPeer(const NodeId& peerNodeId, SessionId sessionId, const ByteVector& sessionKey);
     bool GetSessionKeyForPeer(const NodeId& peerNodeId, ByteVector& sessionKeyOut) const;
@@ -168,8 +220,74 @@ private:
     void PrintStoredConversation(const NodeId& peerNodeId, const std::string& peerNicknameHint = "") const;
     bool LoadOrCreateLocalIdentity();
     void RestorePrivateSessionsFromHistory();
+    bool SaveOverlayState() const;
+    void LoadOverlayState();
+    void ProcessOverlayPrivateMessage(const PrivateMessagePayload& payload);
+    void SendGroupSnapshotToMember(const GroupEntry& group, const GroupMemberEntry& member);
+    std::vector<ContactEntry> GetSortedContacts() const;
+    std::vector<DeviceEntry> GetSortedDevices() const;
+    std::vector<GroupEntry> GetSortedGroups() const;
+    std::string BuildGroupSyncText(const GroupEntry& group) const;
+    bool ApplyGroupSyncText(const NodeId& senderNodeId, const std::string& text);
+    bool ApplyDeviceLinkText(const NodeId& senderNodeId, const std::string& text);
+    bool ApplyFileMetaText(const NodeId& senderNodeId, const std::string& text);
+    bool SendFileOfferToPeer(const NodeId& targetNodeId, const std::string& displayName, const std::filesystem::path& srcPath, const std::string& groupId = "", const std::string& groupName = "");
+    bool ApplyFileOfferText(const NodeId& senderNodeId, const std::string& senderNickname, const std::string& text);
+    bool ApplyFileAcceptText(const NodeId& senderNodeId, const std::string& text);
+    bool ApplyFileRejectText(const NodeId& senderNodeId, const std::string& text);
+    bool ApplyFileChunkText(const NodeId& senderNodeId, const std::string& text);
+    ControlEnvelope ParseControlEnvelope(const PrivateMessagePayload& payload) const;
+    bool DispatchControlMessage(const ControlEnvelope& envelope);
+    void UpdateControlState(const std::string& key, ControlFlowState state);
+    std::string MakeControlStateKey(const ControlEnvelope& envelope) const;
+    bool MirrorConversationToDevice(const NodeId& deviceNodeId, std::size_t maxMessages = 16);
+    bool ApplyDeviceSyncText(const NodeId& senderNodeId, const std::string& text);
 
 private:
+    struct FileTransferStatus {
+        std::string transferId;
+        NodeId peerNodeId;
+        std::string peerNickname;
+        std::string fileName;
+        std::uint64_t fileSize = 0;
+        FileTransferState state = FileTransferState::Offered;
+        std::size_t currentChunk = 0;
+        std::size_t totalChunks = 0;
+        bool incoming = false;
+        std::string groupName;
+        std::int64_t updatedAtUnix = 0;
+    };
+
+    struct OutgoingFileTransfer {
+        std::string transferId;
+        NodeId targetNodeId;
+        std::string targetNickname;
+        std::string fileName;
+        std::uint64_t fileSize = 0;
+        std::string groupId;
+        std::string groupName;
+        ByteVector bytes;
+    };
+
+    struct IncomingFileOffer {
+        std::string transferId;
+        NodeId senderNodeId;
+        std::string senderNickname;
+        std::string fileName;
+        std::uint64_t fileSize = 0;
+        std::string groupId;
+        std::string groupName;
+        bool accepted = false;
+    };
+
+    struct IncomingFileTransfer {
+        IncomingFileOffer offer;
+        std::size_t totalChunks = 0;
+        std::vector<ByteVector> chunks;
+        std::vector<bool> received;
+        std::size_t receivedCount = 0;
+    };
+
     LocalNodeInfo local_;
     SOCKET listenSocket_ = INVALID_SOCKET;
     SOCKET udpSocket_ = INVALID_SOCKET;
@@ -259,6 +377,19 @@ private:
     std::string contactsRootDir_ = "contacts";
     mutable std::mutex contactsMutex_;
     std::unordered_map<NodeId, ContactEntry> contacts_;
+
+    mutable std::mutex fileTransfersMutex_;
+    std::unordered_map<std::string, OutgoingFileTransfer> outgoingFileTransfers_;
+    std::unordered_map<std::string, IncomingFileOffer> pendingIncomingFileOffers_;
+    std::unordered_map<std::string, IncomingFileTransfer> incomingFileTransfers_;
+    std::unordered_map<std::string, FileTransferStatus> fileTransferStatuses_;
+
+    std::string overlayRootDir_ = "overlay";
+    mutable std::mutex overlayMutex_;
+    OverlayState overlayState_;
+
+    mutable std::mutex controlStateMutex_;
+    std::unordered_map<std::string, ControlFlowState> controlStates_;
 
     const std::string sessionRootDir_ = "sessions";
 

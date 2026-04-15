@@ -9,20 +9,13 @@ struct ContactEntry {
     NodeId nodeId;
     std::string nickname;
     ByteVector publicKeyBlob;
-    ByteVector encryptPublicKeyBlob;
     std::string fingerprint;
-    std::string previousFingerprint;
     bool trusted = true;
     bool blocked = false;
-    bool keyMismatch = false;
     std::int64_t addedAtUnix = 0;
     std::string lastKnownIp;
     std::uint16_t lastKnownPort = 0;
     NodeId preferredRelayNodeId;
-    ByteVector pendingPublicKeyBlob;
-    ByteVector pendingEncryptPublicKeyBlob;
-    std::string pendingFingerprint;
-    std::int64_t lastIdentityMigrationUnix = 0;
 };
 
 class ContactStore {

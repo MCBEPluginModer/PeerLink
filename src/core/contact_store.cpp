@@ -1,12 +1,12 @@
 #include "core/contact_store.h"
 #include "core/fingerprint_utils.h"
 
-#include <algorithm>
-#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <ctime>
+#include <algorithm>
 
 namespace p2p {
 namespace fs = std::filesystem;
@@ -52,6 +52,31 @@ bool HexDecodeString(const std::string& hex, std::string& out) {
     return true;
 }
 
+bool IsLikelyHex(const std::string& s) {
+    if (s.empty() || (s.size() % 2) != 0) return false;
+    for (char ch : s) {
+        std::uint8_t nibble = 0;
+        if (!HexNibble(ch, nibble)) return false;
+    }
+    return true;
+}
+
+bool DecodeMaybeHexString(const std::string& in, std::string& out) {
+    if (in.empty()) { out.clear(); return true; }
+    if (IsLikelyHex(in)) {
+        if (HexDecodeString(in, out)) return true;
+    }
+    out = in;
+    return true;
+}
+
+bool IsPrintableAscii(const std::string& s) {
+    for (unsigned char ch : s) {
+        if (ch < 32 || ch > 126) return false;
+    }
+    return true;
+}
+
 fs::path ContactPath(const std::string& rootDir, const NodeId& localNodeId) {
     return fs::path(rootDir) / (localNodeId + ".contacts.txt");
 }
@@ -71,79 +96,49 @@ bool ContactStore::Load(const std::string& rootDir, const NodeId& localNodeId,
     out.clear();
     try {
         fs::create_directories(rootDir);
-        const auto path = ContactPath(rootDir, localNodeId);
+        auto path = ContactPath(rootDir, localNodeId);
         if (!fs::exists(path)) return true;
-
         std::ifstream in(path, std::ios::binary);
         if (!in) {
             if (error) *error = "failed to open contact file";
             return false;
         }
-
         std::string line;
         while (std::getline(in, line)) {
             if (line.empty() || line[0] == '#') continue;
-            const auto parts = SplitTab(line);
+            auto parts = SplitTab(line);
+            if (parts.size() < 3) continue;
             ContactEntry c{};
-
-            // New format with persisted encrypt/migration fields.
-            if (parts.size() >= 17) {
-                std::string nodeId;
-                if (!HexDecodeString(parts[0], nodeId)) continue;
-                c.nodeId = nodeId;
-                if (!HexDecodeString(parts[1], c.nickname)) continue;
-                if (!HexDecode(parts[2], c.publicKeyBlob)) continue;
-                HexDecode(parts[3], c.encryptPublicKeyBlob);
-                HexDecodeString(parts[4], c.fingerprint);
-                HexDecodeString(parts[5], c.previousFingerprint);
-                c.trusted = (parts[6] == "1");
-                c.blocked = (parts[7] == "1");
-                c.keyMismatch = (parts[8] == "1");
-                try { c.addedAtUnix = std::stoll(parts[9]); } catch (...) { c.addedAtUnix = 0; }
-                HexDecodeString(parts[10], c.lastKnownIp);
-                try { c.lastKnownPort = static_cast<std::uint16_t>(std::stoul(parts[11])); } catch (...) { c.lastKnownPort = 0; }
-                HexDecodeString(parts[12], c.preferredRelayNodeId);
-                HexDecode(parts[13], c.pendingPublicKeyBlob);
-                HexDecode(parts[14], c.pendingEncryptPublicKeyBlob);
-                HexDecodeString(parts[15], c.pendingFingerprint);
-                try { c.lastIdentityMigrationUnix = std::stoll(parts[16]); } catch (...) { c.lastIdentityMigrationUnix = 0; }
-            } else if (parts.size() >= 13) {
-                // Older mismatch-aware format.
-                std::string nodeId;
-                if (!HexDecodeString(parts[0], nodeId)) continue;
-                c.nodeId = nodeId;
-                if (!HexDecodeString(parts[1], c.nickname)) continue;
-                if (!HexDecode(parts[2], c.publicKeyBlob)) continue;
-                HexDecodeString(parts[3], c.fingerprint);
-                c.trusted = (parts[4] == "1");
-                c.blocked = (parts[5] == "1");
-                try { c.addedAtUnix = std::stoll(parts[6]); } catch (...) { c.addedAtUnix = 0; }
-                HexDecodeString(parts[7], c.lastKnownIp);
-                try { c.lastKnownPort = static_cast<std::uint16_t>(std::stoul(parts[8])); } catch (...) { c.lastKnownPort = 0; }
-                HexDecodeString(parts[9], c.preferredRelayNodeId);
-                c.keyMismatch = (parts[10] == "1");
-                HexDecode(parts[11], c.pendingPublicKeyBlob);
-                HexDecodeString(parts[12], c.pendingFingerprint);
-            } else if (parts.size() >= 10) {
-                // Very old format.
-                std::string nodeId;
-                if (!HexDecodeString(parts[0], nodeId)) continue;
-                c.nodeId = nodeId;
-                if (!HexDecodeString(parts[1], c.nickname)) continue;
-                if (!HexDecode(parts[2], c.publicKeyBlob)) continue;
-                HexDecodeString(parts[3], c.fingerprint);
-                c.trusted = (parts[4] == "1");
-                c.blocked = (parts[5] == "1");
-                try { c.addedAtUnix = std::stoll(parts[6]); } catch (...) { c.addedAtUnix = 0; }
-                HexDecodeString(parts[7], c.lastKnownIp);
-                try { c.lastKnownPort = static_cast<std::uint16_t>(std::stoul(parts[8])); } catch (...) { c.lastKnownPort = 0; }
-                HexDecodeString(parts[9], c.preferredRelayNodeId);
-            } else {
-                continue;
+            std::string nodeId;
+            if (!DecodeMaybeHexString(parts[0], nodeId) || nodeId.empty()) continue;
+            c.nodeId = nodeId;
+            if (parts.size() >= 2) {
+                if (!DecodeMaybeHexString(parts[1], c.nickname)) c.nickname.clear();
             }
-
-            if (c.fingerprint.empty() && !c.publicKeyBlob.empty()) c.fingerprint = ComputeFingerprint(c.publicKeyBlob);
-            if (c.pendingFingerprint.empty() && !c.pendingPublicKeyBlob.empty()) c.pendingFingerprint = ComputeFingerprint(c.pendingPublicKeyBlob);
+            if (parts.size() >= 3 && !parts[2].empty()) {
+                if (!HexDecode(parts[2], c.publicKeyBlob)) c.publicKeyBlob.clear();
+            }
+            if (parts.size() >= 4) {
+                DecodeMaybeHexString(parts[3], c.fingerprint);
+            }
+            if (!c.publicKeyBlob.empty()) {
+                auto computed = ComputeFingerprint(c.publicKeyBlob);
+                if (c.fingerprint.empty() || !IsPrintableAscii(c.fingerprint) || c.fingerprint.find(':') == std::string::npos) {
+                    c.fingerprint = computed;
+                }
+            } else if (!IsPrintableAscii(c.fingerprint)) {
+                c.fingerprint.clear();
+            }
+            c.trusted = parts.size() >= 5 ? (parts[4] == "1" || parts[4] == "true") : false;
+            c.blocked = parts.size() >= 6 ? (parts[5] == "1" || parts[5] == "true") : false;
+            if (parts.size() >= 7) {
+                try { c.addedAtUnix = std::stoll(parts[6]); } catch (...) { c.addedAtUnix = 0; }
+            }
+            if (parts.size() >= 8) DecodeMaybeHexString(parts[7], c.lastKnownIp);
+            if (parts.size() >= 9) {
+                try { c.lastKnownPort = static_cast<std::uint16_t>(std::stoul(parts[8])); } catch (...) { c.lastKnownPort = 0; }
+            }
+            if (parts.size() >= 10) DecodeMaybeHexString(parts[9], c.preferredRelayNodeId);
             out[c.nodeId] = std::move(c);
         }
         return true;
@@ -158,39 +153,29 @@ bool ContactStore::Save(const std::string& rootDir, const NodeId& localNodeId,
                         std::string* error) {
     try {
         fs::create_directories(rootDir);
-        const auto path = ContactPath(rootDir, localNodeId);
+        auto path = ContactPath(rootDir, localNodeId);
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) {
             if (error) *error = "failed to open contact file for write";
             return false;
         }
-
-        out << "# nodeId\tnickname\tverifyPubKey\tencryptPubKey\tfingerprint\tpreviousFingerprint\ttrusted\tblocked\tkeyMismatch\taddedAt\tip\tport\tpreferredRelay\tpendingVerifyPubKey\tpendingEncryptPubKey\tpendingFingerprint\tlastIdentityMigration\n";
-
+        out << "# nodeId\tnickname\tpubkey\tfingerprint\ttrusted\tblocked\taddedAt\tip\tport\tpreferredRelay\n";
         std::vector<NodeId> ids;
         ids.reserve(contacts.size());
         for (const auto& [id, _] : contacts) ids.push_back(id);
         std::sort(ids.begin(), ids.end());
-
         for (const auto& id : ids) {
             const auto& c = contacts.at(id);
             out << HexEncodeString(c.nodeId) << '\t'
                 << HexEncodeString(c.nickname) << '\t'
                 << HexEncode(c.publicKeyBlob) << '\t'
-                << HexEncode(c.encryptPublicKeyBlob) << '\t'
                 << HexEncodeString(c.fingerprint) << '\t'
-                << HexEncodeString(c.previousFingerprint) << '\t'
                 << (c.trusted ? '1' : '0') << '\t'
                 << (c.blocked ? '1' : '0') << '\t'
-                << (c.keyMismatch ? '1' : '0') << '\t'
                 << c.addedAtUnix << '\t'
                 << HexEncodeString(c.lastKnownIp) << '\t'
                 << c.lastKnownPort << '\t'
-                << HexEncodeString(c.preferredRelayNodeId) << '\t'
-                << HexEncode(c.pendingPublicKeyBlob) << '\t'
-                << HexEncode(c.pendingEncryptPublicKeyBlob) << '\t'
-                << HexEncodeString(c.pendingFingerprint) << '\t'
-                << c.lastIdentityMigrationUnix << '\n';
+                << HexEncodeString(c.preferredRelayNodeId) << '\n';
         }
         return true;
     } catch (const std::exception& ex) {
@@ -231,9 +216,7 @@ bool ContactStore::ParseInviteCode(const std::string& code, ContactEntry& out, s
         if (error) *error = "invalid public key in invite";
         return false;
     }
-    out.fingerprint = ComputeFingerprint(out.publicKeyBlob);
     out.trusted = true;
-    out.keyMismatch = false;
     out.blocked = false;
     out.addedAtUnix = static_cast<std::int64_t>(std::time(nullptr));
     return true;

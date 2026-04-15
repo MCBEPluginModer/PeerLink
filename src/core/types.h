@@ -235,24 +235,12 @@ struct PendingInvite {
     NodeId toNodeId;
 };
 
-enum class PrivateSessionState : std::uint8_t {
-    PendingOutgoingInvite = 1,
-    PendingIncomingInvite = 2,
-    AwaitingKey = 3,
-    Active = 4,
-    Mismatch = 5,
-    Closed = 6
-};
-
 struct PrivateSession {
     SessionId sessionId = 0;
     NodeId peerNodeId;
     std::string peerNickname;
     ByteVector sessionKey;
     bool active = false;
-    PrivateSessionState state = PrivateSessionState::AwaitingKey;
-    std::string lastError;
-    std::int64_t stateUpdatedAtUnix = 0;
 };
 
 struct DisplayUser {
