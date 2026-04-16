@@ -1,10 +1,24 @@
 #include "net/p2p_node.h"
+#include "core/app_config.h"
+#include "core/logger.h"
+#include "core/utils.h"
+#include "ui/console_ui.h"
 
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <sstream>
 #include <string>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 struct UiState {
     enum class Mode { Global, Private };
@@ -14,43 +28,66 @@ struct UiState {
 };
 
 static void PrintHelp() {
-    std::cout
-        << "\nCommands:\n"
-        << "/help                      - show help\n"
-        << "/users                     - show known users\n"
-        << "/contacts                  - show saved contacts\n"
-        << "/fingerprint               - show local identity fingerprint\n"
-        << "/trust <n>                 - mark contact from /contacts as trusted\n"
-        << "/untrust <n>               - mark contact from /contacts as untrusted\n"
-        << "/connect <ip> <port>       - connect manually\n"
-        << "/addcontact <n>            - add contact from /users list\n"
-        << "/removecontact <n>         - remove contact from /users list\n"
-        << "/renamecontact <n> <name>  - rename contact from /users list\n"
-        << "/invitecode                - generate your invite code\n"
-        << "/addinvite <code>          - add contact using invite code\n"
-        << "/invite <n>                - invite user from /users list to private chat\n"
-        << "/invites                   - show incoming invites\n"
-        << "/accept <n>                - accept invite from /invites list\n"
-        << "/reject <n>                - reject invite from /invites list\n"
-        << "/chat <n>                  - switch to private chat using /users list\n"
-        << "/deletechat <n>            - delete local chat history\n"
-        << "/leave                     - leave private chat\n"
-        << "/all <text>                - send to global chat\n"
-        << "/sessions                  - list private chats\n"
-        << "/devices                   - list linked devices\n"
-        << "/linkdevice <contact> [l]  - link trusted contact as device\n"
-        << "/revokedevice <n>          - revoke linked device\n"
-        << "/groups                    - list groups\n"
-        << "/mkgroup <name>            - create group\n"
-        << "/groupadd <g> <contact>    - add member to group\n"
-        << "/groupremove <g> <contact> - remove member from group\n"
-        << "/grouprole <g> <c> <role>  - set member role\n"
-        << "/groupsync <g>             - sync group snapshot\n"
-        << "/groupmsg <g> <text>       - send group message\n"
-        << "/attach <contact> <path>   - send attachment metadata\n"
-        << "/info                      - self info\n"
-        << "/exit                      - quit\n\n"
-        << "Bootstrap nodes are loaded from bootstrap_nodes.txt (one ip:port per line).\n\n";
+    using p2p::ui::CommandHelpItem;
+    p2p::ui::PrintHelpTable("Discovery & identity", {
+        {"/help", "show this help"},
+        {"/users", "show known users"},
+        {"/contacts", "show saved contacts"},
+        {"/fingerprint", "show local signing fingerprint"},
+        {"/keys", "show key lifecycle status"},
+        {"/keybackup [dir]", "backup public key material manifest"},
+        {"/keyrotate", "rotate local signing/exchange keys"},
+        {"/keyrevoke", "revoke local key container (restart after)"}
+    });
+    p2p::ui::PrintHelpTable("Connections & chats", {
+        {"/connect <ip> <port>", "connect manually"},
+        {"/invitecode", "generate your invite code"},
+        {"/addinvite <code>", "add contact using invite code"},
+        {"/invite <n>", "invite user from /users list to private chat"},
+        {"/invites", "show incoming invites"},
+        {"/accept <n>", "accept invite"},
+        {"/reject <n>", "reject invite"},
+        {"/chat <n>", "switch to private chat using /users list"},
+        {"/leave", "leave private chat and return to global"},
+        {"/sessions", "list private chats"},
+        {"/deletechat <n>", "delete local chat history"}
+    });
+    p2p::ui::PrintHelpTable("Contacts & trust", {
+        {"/addcontact <n>", "add contact from /users list"},
+        {"/removecontact <n>", "remove contact from /users list"},
+        {"/renamecontact <n> <name>", "rename contact"},
+        {"/trust <n>", "mark contact from /contacts as trusted"},
+        {"/untrust <n>", "mark contact from /contacts as untrusted"}
+    });
+    p2p::ui::PrintHelpTable("Devices, groups & files", {
+        {"/devices", "show linked devices"},
+        {"/linkdevice <contactIndex> [label]", "link selected contact as your device"},
+        {"/revokedevice <deviceIndex>", "revoke linked device"},
+        {"/syncdevice <deviceIndex>", "sync recent conversations to device"},
+        {"/groups", "show groups"},
+        {"/creategroup <name>", "create group"},
+        {"/groupadd <groupIndex> <contactIndex>", "add member to group"},
+        {"/groupremove <groupIndex> <contactIndex>", "remove member from group"},
+        {"/grouprole <groupIndex> <contactIndex> <role>", "change member role"},
+        {"/groupsync <groupIndex>", "send group snapshot to members"},
+        {"/groupmsg <groupIndex> <text>", "send group text message"},
+        {"/sendfile <contactIndex> <path>", "send file to contact"},
+        {"/sendgroupfile <groupIndex> <path>", "send file to group"},
+        {"/pendingfiles", "list pending incoming files"},
+        {"/download <n>", "accept and download pending file"},
+        {"/rejectfile <n>", "reject pending file"},
+        {"/transfers", "list file transfer states"},
+        {"/controlstates", "list protocol control states"}
+    });
+    p2p::ui::PrintHelpTable("Diagnostics", {
+        {"/status", "show current UI/session status"},
+        {"/config", "show effective config"},
+        {"/reputation", "show peer reputation scores"},
+        {"/info", "show local node info"},
+        {"/exit", "quit"}
+    });
+    p2p::ui::PrintTip("Regular chat text without a slash is sent to the current target (global or private).");
+    std::cout << "\nBootstrap nodes are loaded from bootstrap_nodes.txt (one ip:port per line).\n\n";
 }
 
 static std::optional<p2p::DisplayUser> ResolveUserByIndex(const std::vector<p2p::DisplayUser>& users, int index) {
@@ -67,35 +104,82 @@ int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    if (argc < 3) {
+    const std::string configPath = "messenger.cfg";
+    p2p::AppConfig config{};
+    std::string configError;
+    const bool loadedConfig = p2p::ConfigManager::LoadFromFile(configPath, config, &configError);
+
+    if (!loadedConfig && (argc < 3)) {
+        p2p::AppConfig templateConfig{};
+        templateConfig.listenPort = 4000;
+        templateConfig.nickname = "peer";
+        std::string saveError;
+        p2p::ConfigManager::SaveToFile(configPath, templateConfig, &saveError);
+    }
+
+    if (argc >= 2) {
+        try {
+            const int value = std::stoi(argv[1]);
+            if (value <= 0 || value > 65535) {
+                std::cout << "Invalid listen port\n";
+                return 1;
+            }
+            config.listenPort = static_cast<std::uint16_t>(value);
+        } catch (...) {
+            std::cout << "Invalid listen port\n";
+            return 1;
+        }
+    }
+
+    if (argc >= 3) config.nickname = argv[2];
+
+    if (config.listenPort == 0 || config.nickname.empty()) {
         std::cout << "Usage: messenger <listen_port> <nickname>\n";
+        std::cout << "Or create messenger.cfg and set listen_port / nickname there.\n";
         return 1;
     }
 
-    std::uint16_t port = 0;
-    try {
-        int value = std::stoi(argv[1]);
-        if (value <= 0 || value > 65535) return 1;
-        port = static_cast<std::uint16_t>(value);
-    } catch (...) {
+    if (!p2p::Logger::Instance().Configure(
+            config.logFile,
+            p2p::Logger::ParseLevel(config.logLevel),
+            config.logToConsole,
+            config.logTimestamps)) {
+        std::cout << "Failed to initialize logger: " << config.logFile << "\n";
         return 1;
     }
 
-    p2p::P2PNode node(argv[2], port);
+    if (loadedConfig) {
+        p2p::utils::LogSystem("Loaded config from " + configPath);
+    } else {
+        p2p::utils::LogWarn("Config file not loaded (" + configError + "). Using CLI/default values.");
+    }
+
+    if (!std::filesystem::exists(configPath)) {
+        std::string saveError;
+        if (p2p::ConfigManager::SaveToFile(configPath, config, &saveError)) {
+            p2p::utils::LogSystem("Created default config file at " + configPath);
+        } else {
+            p2p::utils::LogWarn("Failed to create default config file: " + saveError);
+        }
+    }
+
+    p2p::P2PNode node(config.nickname, config.listenPort);
     if (!node.Start()) return 1;
 
     UiState ui{};
+    if (config.uiShowBanner) {
+        p2p::ui::PrintBanner({config.nickname, config.listenPort, config.uiCompactMode});
+    }
     PrintHelp();
+    p2p::ui::PrintStatusLine("global", "", true);
+    p2p::ui::PrintTip("Start with /users to inspect discovered peers or /invitecode to share your identity.");
 
     std::string line;
     while (true) {
-        if (ui.mode == UiState::Mode::Global) {
-            std::cout << "[Global] > ";
-        } else if (node.IsPeerConnected(ui.currentPrivatePeerId)) {
-            std::cout << "[Private | " << ui.currentPrivatePeerNickname << "] > ";
-        } else {
-            std::cout << "[Private | " << ui.currentPrivatePeerNickname << " | relay/reconnecting] > ";
-        }
+        const bool isConnected = (ui.mode == UiState::Mode::Global) ? true : node.IsPeerConnected(ui.currentPrivatePeerId);
+        const std::string modeText = (ui.mode == UiState::Mode::Global) ? "global" : "private";
+        const std::string targetText = (ui.mode == UiState::Mode::Global) ? "" : ui.currentPrivatePeerNickname;
+        std::cout << p2p::ui::BuildPrompt(modeText, targetText, isConnected);
 
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
@@ -118,6 +202,21 @@ int main(int argc, char* argv[]) {
             node.PrintContacts();
         } else if (cmd == "/fingerprint") {
             node.PrintFingerprint();
+        } else if (cmd == "/keys") {
+            node.PrintKeyStatus();
+        } else if (cmd == "/keybackup") {
+            std::string dir;
+            std::getline(iss, dir);
+            if (!dir.empty() && dir[0] == " "[0]) dir.erase(0, 1);
+            if (dir.empty()) dir = "profile/key_backups";
+            if (node.BackupLocalKeys(dir)) p2p::ui::PrintSuccess("Key backup manifest created.");
+            else p2p::ui::PrintError("Key backup failed.");
+        } else if (cmd == "/keyrotate") {
+            if (node.RotateLocalKeys()) p2p::ui::PrintWarning("Local keys rotated. Share your new fingerprint with trusted contacts.");
+            else p2p::ui::PrintError("Key rotation failed.");
+        } else if (cmd == "/keyrevoke") {
+            if (node.RevokeLocalKeys()) p2p::ui::PrintWarning("Local keys revoked. Restart the messenger before continuing.");
+            else p2p::ui::PrintError("Key revoke failed.");
         } else if (cmd == "/trust") {
             int idx = 0; iss >> idx;
             if (!node.TrustContactByIndex(idx)) std::cout << "[Error] Failed to trust contact\n";
@@ -218,6 +317,9 @@ int main(int argc, char* argv[]) {
         } else if (cmd == "/revokedevice") {
             int idx = 0; iss >> idx;
             if (!node.RevokeDeviceByIndex(idx)) std::cout << "[Error] Failed to revoke device\n";
+        } else if (cmd == "/syncdevices") {
+            int idx = 0; iss >> idx;
+            if (!node.SyncDeviceByIndex(idx)) std::cout << "[Error] Failed to sync device\n";
         } else if (cmd == "/groups") {
             node.PrintGroups();
         } else if (cmd == "/mkgroup") {
@@ -259,10 +361,22 @@ int main(int argc, char* argv[]) {
         } else if (cmd == "/rejectfile") {
             int idx = 0; iss >> idx;
             if (!node.RejectPendingFileByIndex(idx)) std::cout << "[Error] Failed to reject file\n";
+        } else if (cmd == "/transfers") {
+            node.PrintFileTransfers();
+        } else if (cmd == "/controlstates") {
+            node.PrintControlStates();
+        } else if (cmd == "/status") {
+            p2p::ui::PrintStatusLine(modeText, targetText, isConnected);
+        } else if (cmd == "/reputation") {
+            node.PrintPeerReputation();
+        } else if (cmd == "/config") {
+            std::cout << p2p::ConfigManager::ToDisplayString(config) << "\n";
         } else if (cmd == "/info") {
             node.PrintInfo();
         } else if (cmd == "/exit") {
             break;
+        } else {
+            std::cout << "[Error] Unknown command. Use /help\n";
         }
     }
 

@@ -16,7 +16,26 @@ struct AesPlaintextKeyBlob {
 CryptoSigner::CryptoSigner() = default;
 CryptoSigner::~CryptoSigner() { Cleanup(); }
 
+std::wstring CryptoSigner::MakeContainerNameForNodeId(const std::string& nodeId) {
+    return L"MessengerKey_" + std::wstring(nodeId.begin(), nodeId.end());
+}
+
+bool CryptoSigner::ContainerExists(const std::wstring& containerName) {
+    HCRYPTPROV prov = 0;
+    const bool ok = CryptAcquireContextW(&prov, containerName.c_str(), nullptr, PROV_RSA_AES, 0) == TRUE;
+    if (ok) CryptReleaseContext(prov, 0);
+    return ok;
+}
+
+bool CryptoSigner::DeleteContainer(const std::wstring& containerName) {
+    HCRYPTPROV prov = 0;
+    const bool ok = CryptAcquireContextW(&prov, containerName.c_str(), nullptr, PROV_RSA_AES, CRYPT_DELETEKEYSET) == TRUE;
+    if (prov) CryptReleaseContext(prov, 0);
+    return ok;
+}
+
 bool CryptoSigner::Initialize(const std::wstring& containerName) {
+    containerName_ = containerName;
     if (CryptAcquireContextW(&hProv_, containerName.c_str(), nullptr, PROV_RSA_AES, 0)) {
         return EnsureKeyPair();
     }

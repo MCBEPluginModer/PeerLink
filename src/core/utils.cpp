@@ -1,15 +1,12 @@
 #include "core/utils.h"
 
+#include "core/logger.h"
+
 #include <cstring>
-#include <iostream>
-#include <mutex>
 #include <random>
 #include <sstream>
 
 namespace p2p::utils {
-namespace {
-std::mutex g_log_mutex;
-}
 
 std::string GenerateNodeId() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -116,13 +113,31 @@ std::string SocketAddressToIp(const sockaddr_in& addr) {
 }
 
 void LogRaw(const std::string& line) {
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    std::cout << line << std::endl;
+    Logger::Instance().Log(LogLevel::Info, "raw", line);
 }
 
-void LogSystem(const std::string& line) { LogRaw("[System] " + line); }
-void LogError(const std::string& line) { LogRaw("[Error] " + line); }
-void LogGlobal(const std::string& nickname, const std::string& text) { LogRaw("[Global] " + nickname + ": " + text); }
-void LogPrivate(const std::string& nickname, const std::string& text) { LogRaw("[Private | " + nickname + "] " + text); }
+void LogSystem(const std::string& line) {
+    Logger::Instance().Log(LogLevel::Info, "system", line);
+}
+
+void LogWarn(const std::string& line) {
+    Logger::Instance().Log(LogLevel::Warn, "warn", line);
+}
+
+void LogError(const std::string& line) {
+    Logger::Instance().Log(LogLevel::Error, "error", line);
+}
+
+void LogDebug(const std::string& line) {
+    Logger::Instance().Log(LogLevel::Debug, "debug", line);
+}
+
+void LogGlobal(const std::string& nickname, const std::string& text) {
+    Logger::Instance().Log(LogLevel::Info, "global", nickname + ": " + text);
+}
+
+void LogPrivate(const std::string& nickname, const std::string& text) {
+    Logger::Instance().Log(LogLevel::Info, "private", nickname + ": " + text);
+}
 
 } // namespace p2p::utils

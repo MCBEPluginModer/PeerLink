@@ -3,8 +3,11 @@
 #include "core/conversation_store.h"
 #include "core/fingerprint_utils.h"
 #include "core/overlay_state.h"
+#include "core/peer_reputation.h"
 #include "core/types.h"
 #include "crypto/crypto_signer.h"
+#include "crypto/key_lifecycle.h"
+#include "crypto/secure_key_store.h"
 #include "net/known_nodes.h"
 #include "net/peer_manager.h"
 #include "net/router.h"
@@ -56,6 +59,13 @@ enum class FileTransferState {
     Failed
 };
 
+enum class ProtocolFlowResult {
+    None = 0,
+    Retried,
+    TimedOut,
+    Resumed
+};
+
 struct ControlEnvelope {
     ControlMessageKind kind = ControlMessageKind::Unknown;
     std::vector<std::string> parts;
@@ -90,10 +100,15 @@ struct ControlEnvelope {
     std::string BuildLocalInviteCode() const;
     void PrintContacts() const;
     void PrintFingerprint() const;
+    void PrintKeyStatus() const;
+    bool BackupLocalKeys(const std::string& backupDir = "profile/key_backups");
+    bool RotateLocalKeys();
+    bool RevokeLocalKeys();
     bool TrustContactByIndex(int index);
     bool UntrustContactByIndex(int index);
 
     void PrintKnownNodes() const;
+    void PrintPeerReputation() const;
     void PrintInvites() const;
     void PrintSessions() const;
     void PrintInfo() const;
@@ -213,6 +228,11 @@ private:
     bool GetSessionKeyForPeer(const NodeId& peerNodeId, ByteVector& sessionKeyOut) const;
     void RequestHistorySync(const NodeId& peerNodeId);
     void RetryRelayQueues();
+    bool SaveMessageJournalToDisk() const;
+    void LoadMessageJournalFromDisk();
+    void ReplayJournalEntries();
+    void TrackPendingJournalMessage(const PrivateMessagePayload& payload);
+    void RemovePendingJournalMessage(MessageId messageId);
     bool SaveRelaySpoolToDisk() const;
     void LoadRelaySpoolFromDisk();
     void LoadBootstrapNodes();
@@ -239,11 +259,28 @@ private:
     ControlEnvelope ParseControlEnvelope(const PrivateMessagePayload& payload) const;
     bool DispatchControlMessage(const ControlEnvelope& envelope);
     void UpdateControlState(const std::string& key, ControlFlowState state);
+    bool ValidateControlStateTransition(ControlFlowState oldState, ControlFlowState newState) const;
     std::string MakeControlStateKey(const ControlEnvelope& envelope) const;
+    void TickProtocolFlows();
+    ProtocolFlowResult RetryTimedOutControl(const std::string& key);
+    void TickFileTransfers();
+    bool RetryFileTransfer(const std::string& transferId);
+    void ResumePendingFlows();
     bool MirrorConversationToDevice(const NodeId& deviceNodeId, std::size_t maxMessages = 16);
     bool ApplyDeviceSyncText(const NodeId& senderNodeId, const std::string& text);
 
 private:
+    struct ControlStateEntry {
+        ControlFlowState state = ControlFlowState::Idle;
+        std::int64_t updatedAtUnix = 0;
+        std::int64_t deadlineUnix = 0;
+        std::uint32_t retryCount = 0;
+        std::uint32_t maxRetries = 3;
+        ControlMessageKind kind = ControlMessageKind::Unknown;
+        std::string senderNodeId;
+        std::string token;
+    };
+
     struct FileTransferStatus {
         std::string transferId;
         NodeId peerNodeId;
@@ -254,6 +291,12 @@ private:
         std::size_t currentChunk = 0;
         std::size_t totalChunks = 0;
         bool incoming = false;
+        bool resumable = false;
+        bool peerAccepted = false;
+        std::uint32_t retryCount = 0;
+        std::uint32_t maxRetries = 3;
+        std::int64_t deadlineUnix = 0;
+        std::string sourcePath;
         std::string groupName;
         std::int64_t updatedAtUnix = 0;
     };
@@ -309,6 +352,7 @@ private:
     ByteVector localPublicKeyBlob_;
     ByteVector localEncryptPublicKeyBlob_;
     std::string historyRootDir_ = "history";
+    std::string messageJournalRootDir_ = "message_journal";
     std::string relaySpoolRootDir_ = "relay_spool";
     std::string bootstrapConfigPath_ = "bootstrap_nodes.txt";
 
@@ -364,6 +408,19 @@ private:
     std::unordered_set<MessageId> seenMessageAcks_;
     std::unordered_set<MessageId> deliveredOutgoingMessageIds_;
 
+    struct PendingJournalMessage {
+        MessageId messageId = 0;
+        NodeId targetNodeId;
+        ByteVector privateMessagePayload;
+        std::uint32_t replayCount = 0;
+        std::int64_t createdAtUnix = 0;
+        std::int64_t lastAttemptUnix = 0;
+        std::int64_t nextAttemptUnix = 0;
+    };
+
+    mutable std::mutex journalMutex_;
+    std::unordered_map<MessageId, PendingJournalMessage> pendingJournalMessages_;
+
     struct RateLimiterState {
         double generalTokens = 80.0;
         double messageTokens = 24.0;
@@ -373,6 +430,9 @@ private:
 
     mutable std::mutex rateLimitMutex_;
     std::unordered_map<SOCKET, RateLimiterState> rateLimitBySocket_;
+
+    mutable std::mutex reputationMutex_;
+    PeerReputationStore peerReputation_;
 
     std::string contactsRootDir_ = "contacts";
     mutable std::mutex contactsMutex_;
@@ -389,7 +449,7 @@ private:
     OverlayState overlayState_;
 
     mutable std::mutex controlStateMutex_;
-    std::unordered_map<std::string, ControlFlowState> controlStates_;
+    std::unordered_map<std::string, ControlStateEntry> controlStates_;
 
     const std::string sessionRootDir_ = "sessions";
 
@@ -402,6 +462,8 @@ private:
     const double messageRatePerSecond_{6.0};
     const double messageBurst_{24.0};
     const std::uint32_t maxRateViolations_{20};
+    const std::int64_t controlTimeoutSeconds_{20};
+    const std::int64_t transferTimeoutSeconds_{25};
 };
 
 } // namespace p2p

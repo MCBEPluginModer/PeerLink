@@ -2,7 +2,16 @@
 
 #include "core/types.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 #include <wincrypt.h>
 #include <string>
 
@@ -15,6 +24,12 @@ public:
 
     bool Initialize(const std::wstring& containerName);
     void Cleanup();
+
+    const std::wstring& GetContainerName() const { return containerName_; }
+
+    static std::wstring MakeContainerNameForNodeId(const std::string& nodeId);
+    static bool DeleteContainer(const std::wstring& containerName);
+    static bool ContainerExists(const std::wstring& containerName);
 
     bool ExportPublicKey(ByteVector& outBlob) const;
     bool ExportEncryptPublicKey(ByteVector& outBlob) const;
@@ -34,6 +49,7 @@ private:
     bool ImportAesKey(const ByteVector& key, HCRYPTKEY& outKey) const;
 
 private:
+    std::wstring containerName_;
     HCRYPTPROV hProv_ = 0;
     HCRYPTKEY hSignKey_ = 0;
     HCRYPTKEY hExchangeKey_ = 0;

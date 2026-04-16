@@ -1,0 +1,24 @@
+PeerLink beta hardening update
+
+Added in this update:
+- Protocol version bump only: protocol version is now 3
+- Journal Replay Recovery:
+  - pending outgoing private messages are journaled to message_journal/<nodeId>.journal
+  - undelivered journaled messages are replayed after restart from the discovery loop
+  - delivered messages are removed from the journal on ACK
+- Secure Key Storage:
+  - DPAPI-sealed secure metadata stored in profile/secure_keys/<nodeId>.bin
+  - stores container binding, fingerprints, protocol version, revoke state, timestamp
+  - private keys remain in the Windows CryptoAPI key container
+- Peer Reputation:
+  - persisted reputation in profile/reputation/<nodeId>.tsv
+  - penalties for invalid packets, signature failures, rate-limit abuse, disconnects
+  - trust boosts on successful handshakes and manual trust
+  - low-reputation peers can be blocked from auto-connect/handshake
+- UI:
+  - new /reputation command
+  - /users now shows reputation score and blocked state
+
+Existing features left intact:
+- Protocol versioning structure already existed; only the version number was changed
+- Rate limiting already existed and was not redesigned

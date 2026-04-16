@@ -1,0 +1,24 @@
+PeerLink update: key lifecycle management + improved console UI/UX
+
+Added commands:
+  /keys
+  /keybackup [dir]
+  /keyrotate
+  /keyrevoke
+
+What key lifecycle does in this build:
+- Shows active key container status and current fingerprints.
+- Saves backup manifests with public key material and fingerprints.
+- Rotates the CryptoAPI key container in place for the current node identity.
+- Revokes the key container and clears loaded public blobs.
+
+Important:
+- After /keyrotate, contacts should verify your new fingerprint.
+- After /keyrevoke, restart the messenger before sending new messages.
+- Backups created by this build are manifests of public key material and fingerprints, not private-key exports.
+
+UI/UX improvements:
+- grouped help output
+- startup tips
+- clearer command discovery
+- consistent info/warn/error/success line styling

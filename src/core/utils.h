@@ -30,7 +30,9 @@ std::string SocketAddressToIp(const sockaddr_in& addr);
 
 void LogRaw(const std::string& line);
 void LogSystem(const std::string& line);
+void LogWarn(const std::string& line);
 void LogError(const std::string& line);
+void LogDebug(const std::string& line);
 void LogGlobal(const std::string& nickname, const std::string& text);
 void LogPrivate(const std::string& nickname, const std::string& text);
 
