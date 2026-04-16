@@ -26,7 +26,7 @@ using SessionId = std::uint64_t;
 using MessageId = std::uint64_t;
 using ByteVector = std::vector<std::uint8_t>;
 
-constexpr std::uint16_t kProtocolVersion = 2;
+constexpr std::uint16_t kProtocolVersion = 3;
 constexpr std::uint32_t kMaxPacketSize = 1024u * 1024u;
 
 enum class PacketType : std::uint16_t {

@@ -1,24 +1,22 @@
 {
-    cuda_arch_x64_plat_windows = {
+    go_arch_x64_plat_windows = {
         __checked = true,
         __global = true,
         plat = "windows",
         arch = "x64"
     },
-    fpc_arch_x64_plat_windows = {
-        __checked = true,
-        __global = true,
-        plat = "windows",
-        arch = "x64"
-    },
-    clang_arch_x64_plat_windows = {
-        __global = true,
-        plat = "windows",
-        arch = "x64"
+    tool_target_messenger_windows_x64_cxx = {
+        toolchain_info = {
+            cachekey = "msvc_arch_x64_plat_windows",
+            plat = "windows",
+            name = "msvc",
+            arch = "x64"
+        },
+        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe]],
+        toolname = "cl"
     },
     msvc_arch_x64_plat_windows = {
-        vs_sdkver = "10.0.26100.0",
-        arch = "x64",
+        vs_toolset = "14.44.35207",
         vcarchs = {
             "arm",
             "arm64",
@@ -26,47 +24,83 @@
             "x64",
             "x86"
         },
-        vs = "2022",
-        __checked = "2022",
-        plat = "windows",
         __global = true,
+        plat = "windows",
+        vs_sdkver = "10.0.26100.0",
         vcvars = {
-            WindowsLibPath = [[C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0;C:\Program Files (x86)\Windows Kits\10\References\10.0.26100.0]],
-            WindowsSDKVersion = "10.0.26100.0",
-            VisualStudioVersion = "17.0",
-            VS170COMNTOOLS = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\]],
-            INCLUDE = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\ATLMFC\include;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\VS\include;C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\winrt;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\cppwinrt;C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\include\um]],
-            VSCMD_ARG_TGT_ARCH = "x64",
-            ExtensionSdkDir = [[C:\Program Files (x86)\Microsoft SDKs\Windows Kits\10\ExtensionSDKs]],
-            VCToolsInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\]],
-            PATH = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VC\VCPackages;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\TestWindow;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\bin\Roslyn;C:\Program Files (x86)\Microsoft SDKs\Windows\v10.0A\bin\NETFX 4.8 Tools\x64\;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Team Tools\DiagnosticsHub\Collector;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Extensions\Microsoft\CodeCoverage.Console;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin;C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\\x64;C:\Program Files (x86)\Windows Kits\10\bin\\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\\MSBuild\Current\Bin\amd64;C:\Windows\Microsoft.NET\Framework64\v4.0.30319;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\;C:\Python314\Scripts\;C:\Python314\;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\nodejs\;C:\ProgramData\chocolatey\bin;C:\Program Files\Git\cmd;C:\Program Files\dotnet\;C:\Program Files\xmake;C:\Users\Yevhenii\AppData\Local\Microsoft\WindowsApps;C:\Users\Yevhenii\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\Yevhenii\AppData\Roaming\npm;C:\Users\Yevhenii\.dotnet\tools;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VC\Linux\bin\ConnectionManagerExe;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\vcpkg]],
-            VSCMD_ARG_HOST_ARCH = "x64",
             DevEnvdir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\]],
-            UniversalCRTSdkDir = [[C:\Program Files (x86)\Windows Kits\10\]],
-            LIB = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\ATLMFC\lib\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\lib\um\x64;C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\\lib\10.0.26100.0\\um\x64]],
-            VSInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\]],
             WindowsSdkVerBinPath = [[C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\]],
-            VCIDEInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VC\]],
             UCRTVersion = "10.0.26100.0",
+            WindowsSdkDir = [[C:\Program Files (x86)\Windows Kits\10\]],
+            VSInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\]],
+            WindowsSDKVersion = "10.0.26100.0",
+            WindowsLibPath = [[C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0;C:\Program Files (x86)\Windows Kits\10\References\10.0.26100.0]],
             VCToolsVersion = "14.44.35207",
-            VSCMD_VER = "17.14.27",
+            PATH = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VC\VCPackages;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\TestWindow;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\bin\Roslyn;C:\Program Files (x86)\Microsoft SDKs\Windows\v10.0A\bin\NETFX 4.8 Tools\x64\;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Team Tools\DiagnosticsHub\Collector;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Extensions\Microsoft\CodeCoverage.Console;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin;C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\\x64;C:\Program Files (x86)\Windows Kits\10\bin\\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\\MSBuild\Current\Bin\amd64;C:\Windows\Microsoft.NET\Framework64\v4.0.30319;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\;C:\Python314\Scripts\;C:\Python314\;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\nodejs\;C:\ProgramData\chocolatey\bin;C:\Program Files\Git\cmd;C:\Program Files\dotnet\;C:\Program Files\xmake;C:\Users\Yevhenii\AppData\Local\Microsoft\WindowsApps;C:\Users\Yevhenii\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\Yevhenii\AppData\Roaming\npm;C:\Users\Yevhenii\.dotnet\tools;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VC\Linux\bin\ConnectionManagerExe;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\vcpkg]],
             VCInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\]],
+            VSCMD_ARG_HOST_ARCH = "x64",
+            LIB = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\ATLMFC\lib\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\lib\um\x64;C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\\lib\10.0.26100.0\\um\x64]],
+            VS170COMNTOOLS = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\]],
+            VSCMD_VER = "17.14.27",
+            INCLUDE = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\ATLMFC\include;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\VS\include;C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\winrt;C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\cppwinrt;C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8\include\um]],
             LIBPATH = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\ATLMFC\lib\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\lib\x86\store\references;C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0;C:\Program Files (x86)\Windows Kits\10\References\10.0.26100.0;C:\Windows\Microsoft.NET\Framework64\v4.0.30319]],
             VSCMD_ARG_app_plat = "Desktop",
-            VCToolsRedistDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\]],
-            WindowsSdkDir = [[C:\Program Files (x86)\Windows Kits\10\]],
             VS140COMNTOOLS = [[C:\Program Files (x86)\Microsoft Visual Studio 14.0\Common7\Tools\]],
-            WindowsSdkBinPath = [[C:\Program Files (x86)\Windows Kits\10\bin\]]
+            UniversalCRTSdkDir = [[C:\Program Files (x86)\Windows Kits\10\]],
+            VCToolsInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\]],
+            WindowsSdkBinPath = [[C:\Program Files (x86)\Windows Kits\10\bin\]],
+            ExtensionSdkDir = [[C:\Program Files (x86)\Microsoft SDKs\Windows Kits\10\ExtensionSDKs]],
+            VCIDEInstallDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VC\]],
+            VCToolsRedistDir = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\]],
+            VSCMD_ARG_TGT_ARCH = "x64",
+            VisualStudioVersion = "17.0"
         },
-        vs_toolset = "14.44.35207"
+        vs = "2022",
+        __checked = "2022",
+        arch = "x64"
     },
-    rust_arch_x64_plat_windows = {
+    tool_target_messenger_windows_x64_ld = {
+        toolchain_info = {
+            cachekey = "msvc_arch_x64_plat_windows",
+            plat = "windows",
+            name = "msvc",
+            arch = "x64"
+        },
+        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\link.exe]],
+        toolname = "link"
+    },
+    cuda_arch_x64_plat_windows = {
         __checked = true,
         __global = true,
         plat = "windows",
         arch = "x64"
     },
-    go_arch_x64_plat_windows = {
+    zig_arch_x64_plat_windows = {
+        __global = true,
+        plat = "windows",
+        arch = "x64"
+    },
+    tool_target_messenger_windows_x64_cc = {
+        toolchain_info = {
+            cachekey = "msvc_arch_x64_plat_windows",
+            plat = "windows",
+            name = "msvc",
+            arch = "x64"
+        },
+        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe]],
+        toolname = "cl"
+    },
+    tool_target_fuzz_packet_protocol_windows_x64_cc = {
+        toolchain_info = {
+            cachekey = "msvc_arch_x64_plat_windows",
+            plat = "windows",
+            name = "msvc",
+            arch = "x64"
+        },
+        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe]],
+        toolname = "cl"
+    },
+    rust_arch_x64_plat_windows = {
         __checked = true,
         __global = true,
         plat = "windows",
@@ -84,15 +118,15 @@
         plat = "windows",
         arch = "x64"
     },
-    tool_target_messenger_windows_x64_ld = {
-        toolname = "link",
-        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\link.exe]],
+    tool_target_fuzz_packet_protocol_windows_x64_cxx = {
         toolchain_info = {
-            arch = "x64",
             cachekey = "msvc_arch_x64_plat_windows",
             plat = "windows",
-            name = "msvc"
-        }
+            name = "msvc",
+            arch = "x64"
+        },
+        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe]],
+        toolname = "cl"
     },
     nim_arch_x64_plat_windows = {
         __checked = false,
@@ -100,15 +134,16 @@
         plat = "windows",
         arch = "x64"
     },
-    tool_target_messenger_windows_x64_cxx = {
-        toolname = "cl",
-        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe]],
-        toolchain_info = {
-            arch = "x64",
-            cachekey = "msvc_arch_x64_plat_windows",
-            plat = "windows",
-            name = "msvc"
-        }
+    clang_arch_x64_plat_windows = {
+        __global = true,
+        plat = "windows",
+        arch = "x64"
+    },
+    fpc_arch_x64_plat_windows = {
+        __checked = true,
+        __global = true,
+        plat = "windows",
+        arch = "x64"
     },
     gfortran_arch_x64_plat_windows = {
         __checked = true,
@@ -116,20 +151,15 @@
         plat = "windows",
         arch = "x64"
     },
-    zig_arch_x64_plat_windows = {
-        __global = true,
-        plat = "windows",
-        arch = "x64"
-    },
-    tool_target_messenger_windows_x64_cc = {
-        toolname = "cl",
-        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe]],
+    tool_target_fuzz_packet_protocol_windows_x64_ld = {
         toolchain_info = {
-            arch = "x64",
             cachekey = "msvc_arch_x64_plat_windows",
             plat = "windows",
-            name = "msvc"
-        }
+            name = "msvc",
+            arch = "x64"
+        },
+        program = [[C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\link.exe]],
+        toolname = "link"
     },
     nasm_arch_x64_plat_windows = {
         __checked = true,
