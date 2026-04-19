@@ -46,6 +46,15 @@ bool DeserializeHistorySyncRequest(const std::vector<std::uint8_t>& data, Histor
 std::vector<std::uint8_t> SerializeHistorySyncResponse(const HistorySyncResponsePayload& payload);
 bool DeserializeHistorySyncResponse(const std::vector<std::uint8_t>& data, HistorySyncResponsePayload& payload);
 
+std::vector<std::uint8_t> SerializePost(const PostPayload& payload);
+bool DeserializePost(const std::vector<std::uint8_t>& data, PostPayload& payload);
+
+std::vector<std::uint8_t> SerializePostSyncRequest(const PostSyncRequestPayload& payload);
+bool DeserializePostSyncRequest(const std::vector<std::uint8_t>& data, PostSyncRequestPayload& payload);
+
+std::vector<std::uint8_t> SerializePostSyncResponse(const PostSyncResponsePayload& payload);
+bool DeserializePostSyncResponse(const std::vector<std::uint8_t>& data, PostSyncResponsePayload& payload);
+
 std::vector<std::uint8_t> MakePacket(PacketType type, PacketId packetId, const std::vector<std::uint8_t>& payload);
 bool ReadPacket(SOCKET s, PacketHeader& header, std::vector<std::uint8_t>& payload);
 

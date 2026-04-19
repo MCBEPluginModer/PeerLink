@@ -6,6 +6,12 @@
 #include <random>
 #include <sstream>
 
+namespace {
+constexpr std::uint32_t kMaxSerializedStringBytes = 64u * 1024u;
+constexpr std::uint32_t kMaxSerializedBlobBytes = p2p::kMaxPacketSize;
+}
+
+
 namespace p2p::utils {
 
 std::string GenerateNodeId() {
@@ -91,6 +97,7 @@ bool ReadUint64(const ByteVector& data, std::size_t& offset, std::uint64_t& valu
 bool ReadString(const ByteVector& data, std::size_t& offset, std::string& value) {
     std::uint32_t len = 0;
     if (!ReadUint32(data, offset, len)) return false;
+    if (len > kMaxSerializedStringBytes) return false;
     if (offset + len > data.size()) return false;
     value.assign(reinterpret_cast<const char*>(data.data() + offset), len);
     offset += len;
@@ -100,6 +107,7 @@ bool ReadString(const ByteVector& data, std::size_t& offset, std::string& value)
 bool ReadBytes(const ByteVector& data, std::size_t& offset, ByteVector& value) {
     std::uint32_t len = 0;
     if (!ReadUint32(data, offset, len)) return false;
+    if (len > kMaxSerializedBlobBytes) return false;
     if (offset + len > data.size()) return false;
     value.assign(data.begin() + offset, data.begin() + offset + len);
     offset += len;

@@ -5,18 +5,22 @@
 #include "core/overlay_state.h"
 #include "core/peer_reputation.h"
 #include "core/types.h"
+#include "core/version.h"
 #include "crypto/crypto_signer.h"
 #include "crypto/key_lifecycle.h"
 #include "crypto/secure_key_store.h"
 #include "net/known_nodes.h"
 #include "net/peer_manager.h"
 #include "net/router.h"
+#include "net/stun_turn_client.h"
 
 #include <filesystem>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace p2p {
@@ -83,6 +87,8 @@ struct ControlEnvelope {
     bool ConnectToPeer(const std::string& ip, std::uint16_t port);
 
     void BroadcastChat(const std::string& text);
+    bool PublishPost(const std::string& title, const std::string& body);
+    void PrintPosts(std::size_t limit = 20) const;
     void SendInvite(const NodeId& targetNodeId);
     void AcceptInvite(const NodeId& fromNodeId);
     void RejectInvite(const NodeId& fromNodeId, const std::string& reason = "rejected");
@@ -92,6 +98,8 @@ struct ControlEnvelope {
     bool CheckConversationHistory(const NodeId& peerNodeId);
     bool RepairConversationHistory(const NodeId& peerNodeId);
     bool IsPeerConnected(const NodeId& peerNodeId) const;
+    bool ExportConversationHistoryByContactIndex(int index, const std::string& path) const;
+    bool SearchConversationHistoryByContactIndex(int index, const std::string& term) const;
 
     bool AddOrUpdateContact(const NodeId& peerNodeId, const std::string& nickname = "");
     bool RemoveContact(const NodeId& peerNodeId);
@@ -106,12 +114,19 @@ struct ControlEnvelope {
     bool RevokeLocalKeys();
     bool TrustContactByIndex(int index);
     bool UntrustContactByIndex(int index);
+    bool BlockContactByIndex(int index);
+    bool UnblockContactByIndex(int index);
+    bool VerifyContactKeyByIndex(int index);
+    bool UnverifyContactKeyByIndex(int index);
+    bool PrintSafetyNumberByIndex(int index) const;
 
     void PrintKnownNodes() const;
     void PrintPeerReputation() const;
     void PrintInvites() const;
     void PrintSessions() const;
     void PrintInfo() const;
+    void PrintStats() const;
+    void PrintNatStatus() const;
     void PrintDevices() const;
     void PrintGroups() const;
     bool LinkDeviceByContactIndex(int index, const std::string& label = "");
@@ -129,6 +144,7 @@ struct ControlEnvelope {
     void PrintControlStates() const;
     bool AcceptPendingFileByIndex(int index);
     bool RejectPendingFileByIndex(int index);
+    bool CancelFileTransferByIndex(int index);
     bool SyncDeviceByIndex(int index);
     std::vector<DisplayUser> GetDisplayUsers() const;
     std::vector<DisplayInvite> GetDisplayInvites() const;
@@ -152,11 +168,15 @@ private:
     void SendPong(const std::shared_ptr<PeerConnection>& peer);
     void RunHeartbeatChecks();
     void CleanupExpiredRelayQueues();
+    void CleanupPendingHandshakes();
     bool CheckIncomingRateLimit(const std::shared_ptr<PeerConnection>& peer, PacketType type);
 
     void HandleHello(const std::shared_ptr<PeerConnection>& peer, const ByteVector& payload);
     void HandleHelloAck(const std::shared_ptr<PeerConnection>& peer, const ByteVector& payload);
     void HandleChat(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandlePost(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandlePostSyncRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
+    void HandlePostSyncResponse(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
     void HandlePeerList(const ByteVector& payload);
     void HandleInviteRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
     void HandleInviteAccept(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload);
@@ -188,6 +208,8 @@ private:
     std::optional<ContactEntry> FindContact(const NodeId& peerNodeId) const;
     std::string ResolveDisplayName(const NodeId& peerNodeId, const std::string& fallback = "") const;
     void UpsertContactHintsFromKnownNode(const KnownNode& node);
+    bool IsBlockedNode(const NodeId& peerNodeId) const;
+    std::string ComputeSafetyNumberForKey(const ByteVector& keyBlob) const;
 
     ByteVector BuildInviteRequestSignedData(const InviteRequestPayload& p) const;
     ByteVector BuildInviteAcceptSignedData(const InviteAcceptPayload& p) const;
@@ -200,10 +222,19 @@ private:
     ByteVector BuildUdpPunchRequestSignedData(const UdpPunchRequestPayload& p) const;
     ByteVector BuildHistorySyncRequestSignedData(const HistorySyncRequestPayload& p) const;
     ByteVector BuildHistorySyncResponseSignedData(const HistorySyncResponsePayload& p) const;
+    ByteVector BuildPostSignedData(const PostPayload& p) const;
+    ByteVector BuildPostSyncRequestSignedData(const PostSyncRequestPayload& p) const;
+    ByteVector BuildPostSyncResponseSignedData(const PostSyncResponsePayload& p) const;
+void RoutePublishedPost(const PostPayload& payload, PacketId packetId, const NodeId& excludeNodeId = "");
+std::vector<std::shared_ptr<PeerConnection>> SelectRelayPeers(std::size_t maxPeers, const NodeId& excludeNodeId = "") const;
+void RepropagatePostWithDelay(PostPayload payload, PacketId packetId, const NodeId& excludeNodeId = "");
     void RequestReverseConnect(const KnownNode& target);
     void RequestUdpHolePunch(const KnownNode& target);
     bool TryConnectToKnownNode(const KnownNode& node);
     void SendUdpProbeToKnownNodes();
+    void TickNatTraversalServices();
+    void LoadNatTraversalConfig();
+    bool SendStunTurnDatagram(const std::string& ip, std::uint16_t port, const std::vector<std::uint8_t>& data);
     void SendUdpProbeToEndpoint(const std::string& ip, std::uint16_t port);
     void SendUdpPunchBurst(const KnownNode& node, const std::string& reason);
     void HandleUdpDatagram(const std::string& ip, std::uint16_t port, const ByteVector& data);
@@ -229,7 +260,10 @@ private:
     void RequestHistorySync(const NodeId& peerNodeId);
     void RetryRelayQueues();
     bool SaveMessageJournalToDisk() const;
+    bool SaveReplayCacheToDisk() const;
+    void FlushReplayCacheIfDirty() const;
     void LoadMessageJournalFromDisk();
+    void LoadReplayCacheFromDisk();
     void ReplayJournalEntries();
     void TrackPendingJournalMessage(const PrivateMessagePayload& payload);
     void RemovePendingJournalMessage(MessageId messageId);
@@ -256,6 +290,11 @@ private:
     bool ApplyFileAcceptText(const NodeId& senderNodeId, const std::string& text);
     bool ApplyFileRejectText(const NodeId& senderNodeId, const std::string& text);
     bool ApplyFileChunkText(const NodeId& senderNodeId, const std::string& text);
+    bool MarkRecentIncomingMessage(MessageId messageId);
+    bool MarkRecentControlReplay(const std::string& replayKey);
+    std::uint64_t GetLocalCapabilityFlags() const;
+    bool IsCompatibleHello(const HelloPayload& hello, std::string* reason = nullptr) const;
+    bool SendFileChunksStream(const std::string& transferId, std::size_t startChunk);
     ControlEnvelope ParseControlEnvelope(const PrivateMessagePayload& payload) const;
     bool DispatchControlMessage(const ControlEnvelope& envelope);
     void UpdateControlState(const std::string& key, ControlFlowState state);
@@ -268,8 +307,35 @@ private:
     void ResumePendingFlows();
     bool MirrorConversationToDevice(const NodeId& deviceNodeId, std::size_t maxMessages = 16);
     bool ApplyDeviceSyncText(const NodeId& senderNodeId, const std::string& text);
+    void LoadPostsFromDisk();
+    bool SavePostToDisk(const PostPayload& payload, bool signatureVerified);
+    void RequestPostSync(const NodeId& peerNodeId);
 
 private:
+
+    struct RuntimeMetrics {
+        std::uint64_t rateLimitHits = 0;
+        std::uint64_t handshakeRejects = 0;
+        std::uint64_t handshakeFloodRejects = 0;
+        std::uint64_t handshakeCooldownBlocks = 0;
+        std::uint64_t replayDrops = 0;
+        std::uint64_t relayQueueDrops = 0;
+        std::uint64_t fileTransferCancels = 0;
+        std::uint64_t fileTransferCompletions = 0;
+        std::uint64_t fileTransferRetries = 0;
+        std::uint64_t fileTransferFailures = 0;
+        std::uint64_t historySearches = 0;
+        std::uint64_t historyExports = 0;
+        std::uint64_t stunQueries = 0;
+        std::uint64_t stunSuccesses = 0;
+        std::uint64_t turnAllocations = 0;
+        std::uint64_t turnRefreshes = 0;
+        std::uint64_t relayQueuePressureEvents = 0;
+        std::uint64_t relayRetryBudgetDrops = 0;
+        std::uint64_t crashRecoveryRestarts = 0;
+        std::uint64_t crashRecoveryTransferResumes = 0;
+    };
+
     struct ControlStateEntry {
         ControlFlowState state = ControlFlowState::Idle;
         std::int64_t updatedAtUnix = 0;
@@ -298,6 +364,8 @@ private:
         std::int64_t deadlineUnix = 0;
         std::string sourcePath;
         std::string groupName;
+        std::string fileChecksum;
+        std::uint64_t bytesTransferred = 0;
         std::int64_t updatedAtUnix = 0;
     };
 
@@ -309,7 +377,11 @@ private:
         std::uint64_t fileSize = 0;
         std::string groupId;
         std::string groupName;
-        ByteVector bytes;
+        std::string sourcePath;
+        std::size_t totalChunks = 0;
+        std::size_t nextChunkIndex = 0;
+        std::string fileChecksum;
+        bool streamInProgress = false;
     };
 
     struct IncomingFileOffer {
@@ -320,15 +392,30 @@ private:
         std::uint64_t fileSize = 0;
         std::string groupId;
         std::string groupName;
+        std::size_t totalChunks = 0;
+        std::string fileChecksum;
         bool accepted = false;
     };
 
     struct IncomingFileTransfer {
         IncomingFileOffer offer;
         std::size_t totalChunks = 0;
-        std::vector<ByteVector> chunks;
-        std::vector<bool> received;
-        std::size_t receivedCount = 0;
+        std::size_t nextExpectedChunk = 1;
+        std::uint64_t receivedBytes = 0;
+        std::string tempPath;
+        std::string rollingChecksum;
+    };
+
+    struct PublicPostRecord {
+        std::string postId;
+        NodeId authorNodeId;
+        std::string authorNickname;
+        std::uint64_t createdAtUnix = 0;
+        std::string title;
+        std::string body;
+        ByteVector authorPublicKeyBlob;
+        ByteVector signature;
+        bool signatureVerified = false;
     };
 
     LocalNodeInfo local_;
@@ -361,6 +448,18 @@ private:
     std::uint16_t localObservedPort_ = 0;
     std::string localObservedUdpIp_;
     std::uint16_t localObservedUdpPort_ = 0;
+    std::string relayedIp_;
+    std::uint16_t relayedPort_ = 0;
+
+    mutable std::mutex natMutex_;
+    std::vector<nat::ServerEndpoint> stunServers_;
+    std::vector<nat::ServerEndpoint> turnServers_;
+    std::size_t nextStunServerIndex_ = 0;
+    std::size_t nextTurnServerIndex_ = 0;
+    std::int64_t lastStunQueryUnix_ = 0;
+    std::int64_t lastTurnAttemptUnix_ = 0;
+    std::int64_t lastTurnRefreshUnix_ = 0;
+    std::unique_ptr<nat::StunTurnClient> natClient_;
 
     mutable std::mutex pendingMutex_;
     std::unordered_map<SOCKET, std::shared_ptr<PeerConnection>> pendingPeers_;
@@ -377,6 +476,13 @@ private:
     std::unordered_map<NodeId, std::chrono::steady_clock::time_point> lastConnectAttempt_;
     mutable std::mutex bootstrapMutex_;
     std::vector<BootstrapEndpoint> bootstrapNodes_;
+
+    mutable std::mutex postsMutex_;
+    std::vector<PublicPostRecord> postsFeed_;
+    std::unordered_set<std::string> knownPostIds_;
+    std::string postsRootDir_ = "posts";
+    mutable std::mutex postPublishRateMutex_;
+    std::deque<std::int64_t> localPostPublishTimes_;
 
     mutable std::mutex invitesMutex_;
     std::unordered_map<InviteId, PendingInvite> incomingInvites_;
@@ -408,6 +514,15 @@ private:
     std::unordered_set<MessageId> seenMessageAcks_;
     std::unordered_set<MessageId> deliveredOutgoingMessageIds_;
 
+    mutable std::mutex replayMutex_;
+    std::string replayCacheRootDir_ = "profile/replay_cache";
+    std::unordered_set<MessageId> recentIncomingMessageIds_;
+    std::deque<MessageId> recentIncomingMessageOrder_;
+    std::unordered_set<std::string> recentControlReplayKeys_;
+    std::deque<std::string> recentControlReplayOrder_;
+    mutable bool replayCacheDirty_ = false;
+    mutable std::int64_t replayCacheLastFlushUnix_ = 0;
+
     struct PendingJournalMessage {
         MessageId messageId = 0;
         NodeId targetNodeId;
@@ -430,6 +545,13 @@ private:
 
     mutable std::mutex rateLimitMutex_;
     std::unordered_map<SOCKET, RateLimiterState> rateLimitBySocket_;
+
+    mutable std::mutex metricsMutex_;
+    mutable RuntimeMetrics metrics_;
+
+    mutable std::mutex handshakeGuardMutex_;
+    std::unordered_map<std::string, std::deque<std::int64_t>> incomingHandshakeAttemptsByIp_;
+    std::unordered_map<NodeId, std::int64_t> blockedHandshakeUntilByNodeId_;
 
     mutable std::mutex reputationMutex_;
     PeerReputationStore peerReputation_;
@@ -454,7 +576,7 @@ private:
     const std::string sessionRootDir_ = "sessions";
 
     const std::chrono::seconds heartbeatInterval_{5};
-    const std::chrono::seconds heartbeatTimeout_{30};
+    const std::chrono::seconds heartbeatTimeout_{45};
     const std::chrono::hours relayMessageTtl_{24};
     const std::chrono::hours relayAckTtl_{6};
     const double generalRatePerSecond_{16.0};
@@ -463,7 +585,27 @@ private:
     const double messageBurst_{24.0};
     const std::uint32_t maxRateViolations_{20};
     const std::int64_t controlTimeoutSeconds_{20};
-    const std::int64_t transferTimeoutSeconds_{25};
+    const std::int64_t transferTimeoutSeconds_{45};
+    const std::size_t maxRecentIncomingMessageIds_{8192};
+    const std::size_t maxRecentControlReplayKeys_{8192};
+    const std::size_t maxPendingHandshakes_{32};
+    const std::size_t maxHandshakeAttemptsPerIpWindow_{8};
+    const std::int64_t handshakeWindowSeconds_{10};
+    const std::int64_t handshakeTimeoutSeconds_{8};
+    const std::int64_t blockedHandshakeCooldownSeconds_{20};
+    const std::size_t maxRelayQueuePerTarget_{256};
+    const std::size_t maxParallelIncomingTransfers_{3};
+    const std::size_t maxOutgoingFileTransfers_{16};
+    const std::size_t maxPendingIncomingFileOffers_{64};
+    const std::size_t maxPostTitleBytes_{256};
+    const std::size_t maxPostBodyBytes_{64 * 1024};
+    const std::size_t maxPostSyncPostsPerResponse_{512};
+    const std::size_t maxPostSyncBlobBytes_{2 * 1024 * 1024};
+    const std::size_t maxPostPublishesPerMinute_{20};
+    const std::int64_t stunRefreshSeconds_{45};
+    const std::int64_t turnRetrySeconds_{90};
+    const std::int64_t turnRefreshSeconds_{300};
+    const std::size_t relayRetryBudgetPerTarget_{64};
 };
 
 } // namespace p2p

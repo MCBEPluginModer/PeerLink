@@ -39,21 +39,30 @@ void TryAllDeserializers(const ByteVector& data) {
     HistorySyncRequestPayload historyReq{};
     HistorySyncResponsePayload historyResp{};
 
-    (void)p2p::protocol::DeserializeHello(data, hello);
-    (void)p2p::protocol::DeserializeChat(data, chat);
-    (void)p2p::protocol::DeserializePeerList(data, peers);
-    (void)p2p::protocol::DeserializeInviteRequest(data, inviteReq);
-    (void)p2p::protocol::DeserializeInviteAccept(data, inviteAcc);
-    (void)p2p::protocol::DeserializeInviteReject(data, inviteRej);
-    (void)p2p::protocol::DeserializePrivateMessage(data, privateMsg);
-    (void)p2p::protocol::DeserializeConnectRequest(data, connectReq);
-    (void)p2p::protocol::DeserializeUdpPunchRequest(data, udpPunch);
-    (void)p2p::protocol::DeserializeRelayPrivateMessage(data, relayMsg);
-    (void)p2p::protocol::DeserializeMessageAck(data, ack);
-    (void)p2p::protocol::DeserializeRelayMessageAck(data, relayAck);
-    (void)p2p::protocol::DeserializeHistorySyncRequest(data, historyReq);
-    (void)p2p::protocol::DeserializeHistorySyncResponse(data, historyResp);
+    auto run = [&](const char* name, auto&& fn) {
+        try {
+            (void)fn();
+        } catch (const std::bad_alloc&) {
+            throw std::runtime_error(std::string("bad_alloc in ") + name);
+        }
+    };
+
+    run("DeserializeHello", [&] { return p2p::protocol::DeserializeHello(data, hello); });
+    run("DeserializeChat", [&] { return p2p::protocol::DeserializeChat(data, chat); });
+    run("DeserializePeerList", [&] { return p2p::protocol::DeserializePeerList(data, peers); });
+    run("DeserializeInviteRequest", [&] { return p2p::protocol::DeserializeInviteRequest(data, inviteReq); });
+    run("DeserializeInviteAccept", [&] { return p2p::protocol::DeserializeInviteAccept(data, inviteAcc); });
+    run("DeserializeInviteReject", [&] { return p2p::protocol::DeserializeInviteReject(data, inviteRej); });
+    run("DeserializePrivateMessage", [&] { return p2p::protocol::DeserializePrivateMessage(data, privateMsg); });
+    run("DeserializeConnectRequest", [&] { return p2p::protocol::DeserializeConnectRequest(data, connectReq); });
+    run("DeserializeUdpPunchRequest", [&] { return p2p::protocol::DeserializeUdpPunchRequest(data, udpPunch); });
+    run("DeserializeRelayPrivateMessage", [&] { return p2p::protocol::DeserializeRelayPrivateMessage(data, relayMsg); });
+    run("DeserializeMessageAck", [&] { return p2p::protocol::DeserializeMessageAck(data, ack); });
+    run("DeserializeRelayMessageAck", [&] { return p2p::protocol::DeserializeRelayMessageAck(data, relayAck); });
+    run("DeserializeHistorySyncRequest", [&] { return p2p::protocol::DeserializeHistorySyncRequest(data, historyReq); });
+    run("DeserializeHistorySyncResponse", [&] { return p2p::protocol::DeserializeHistorySyncResponse(data, historyResp); });
 }
+
 
 void FuzzPacketWrapping(std::mt19937_64& rng) {
     std::uniform_int_distribution<int> typeDist(static_cast<int>(PacketType::Hello),

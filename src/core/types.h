@@ -26,8 +26,15 @@ using SessionId = std::uint64_t;
 using MessageId = std::uint64_t;
 using ByteVector = std::vector<std::uint8_t>;
 
-constexpr std::uint16_t kProtocolVersion = 3;
+constexpr std::uint16_t kProtocolVersion = 4;
 constexpr std::uint32_t kMaxPacketSize = 1024u * 1024u;
+
+enum CapabilityFlags : std::uint64_t {
+    kCapabilityFileTransferV2 = 1ull << 0,
+    kCapabilityScenarioTests = 1ull << 1,
+    kCapabilityReplayWindow = 1ull << 2,
+    kCapabilityJournalReplay = 1ull << 3
+};
 
 enum class PacketType : std::uint16_t {
     Hello = 1,
@@ -46,7 +53,10 @@ enum class PacketType : std::uint16_t {
     MessageAck = 14,
     RelayMessageAck = 15,
     HistorySyncRequest = 16,
-    HistorySyncResponse = 17
+    HistorySyncResponse = 17,
+    PostMessage = 18,
+    PostSyncRequest = 19,
+    PostSyncResponse = 20
 };
 
 #pragma pack(push, 1)
@@ -71,6 +81,9 @@ struct HelloPayload {
     std::string observedIpForRemote;
     std::uint16_t observedPortForRemote = 0;
     ByteVector publicKeyBlob;
+    std::uint16_t minSupportedVersion = kProtocolVersion;
+    std::uint16_t maxSupportedVersion = kProtocolVersion;
+    std::uint64_t capabilityFlags = kCapabilityFileTransferV2 | kCapabilityReplayWindow | kCapabilityJournalReplay;
 };
 
 struct ChatPayload {
@@ -203,6 +216,37 @@ struct HistorySyncResponsePayload {
     NodeId responderNodeId;
     NodeId targetNodeId;
     ByteVector messagesBlob;
+    ByteVector signature;
+};
+
+
+struct PostPayload {
+    std::string postId;
+    NodeId authorNodeId;
+    std::string authorNickname;
+    std::uint64_t createdAtUnix = 0;
+    std::string title;
+    std::string body;
+    ByteVector authorPublicKeyBlob;
+    ByteVector signature;
+    std::uint32_t relayHopsRemaining = 0;
+    std::uint32_t publishDelayMs = 0;
+    bool hiddenOrigin = false;
+};
+
+
+
+struct PostSyncRequestPayload {
+    NodeId requesterNodeId;
+    std::uint64_t sinceCreatedAtUnix = 0;
+    std::uint32_t maxPosts = 0;
+    ByteVector signature;
+};
+
+struct PostSyncResponsePayload {
+    NodeId responderNodeId;
+    NodeId targetNodeId;
+    ByteVector postsBlob;
     ByteVector signature;
 };
 

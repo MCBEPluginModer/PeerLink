@@ -16,6 +16,9 @@ struct ContactEntry {
     std::string lastKnownIp;
     std::uint16_t lastKnownPort = 0;
     NodeId preferredRelayNodeId;
+    bool keyVerified = false;
+    std::string safetyNumber;
+    std::int64_t verifiedAtUnix = 0;
 };
 
 class ContactStore {

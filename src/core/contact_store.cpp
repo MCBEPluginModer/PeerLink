@@ -139,6 +139,9 @@ bool ContactStore::Load(const std::string& rootDir, const NodeId& localNodeId,
                 try { c.lastKnownPort = static_cast<std::uint16_t>(std::stoul(parts[8])); } catch (...) { c.lastKnownPort = 0; }
             }
             if (parts.size() >= 10) DecodeMaybeHexString(parts[9], c.preferredRelayNodeId);
+            c.keyVerified = parts.size() >= 11 ? (parts[10] == "1" || parts[10] == "true") : false;
+            if (parts.size() >= 12) DecodeMaybeHexString(parts[11], c.safetyNumber);
+            if (parts.size() >= 13) { try { c.verifiedAtUnix = std::stoll(parts[12]); } catch (...) { c.verifiedAtUnix = 0; } }
             out[c.nodeId] = std::move(c);
         }
         return true;
@@ -175,7 +178,10 @@ bool ContactStore::Save(const std::string& rootDir, const NodeId& localNodeId,
                 << c.addedAtUnix << '\t'
                 << HexEncodeString(c.lastKnownIp) << '\t'
                 << c.lastKnownPort << '\t'
-                << HexEncodeString(c.preferredRelayNodeId) << '\n';
+                << HexEncodeString(c.preferredRelayNodeId) << '\t'
+                << (c.keyVerified ? '1' : '0') << '\t'
+                << HexEncodeString(c.safetyNumber) << '\t'
+                << c.verifiedAtUnix << '\n';
         }
         return true;
     } catch (const std::exception& ex) {

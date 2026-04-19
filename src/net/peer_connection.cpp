@@ -113,6 +113,11 @@ bool PeerConnection::IsHeartbeatTimedOut(std::chrono::steady_clock::time_point n
     return nowMs > lastRx + timeoutMs;
 }
 
+std::size_t PeerConnection::GetQueuedPacketCount() const {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    return sendQueue_.size();
+}
+
 bool PeerConnection::TryBeginClosing() {
     PeerState s = state_.load(std::memory_order_acquire);
     while (true) {

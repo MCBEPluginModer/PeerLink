@@ -5,6 +5,10 @@
 
 namespace p2p::protocol {
 
+namespace {
+constexpr std::uint32_t kMaxPeerListEntries = 4096u;
+}
+
 std::vector<std::uint8_t> SerializeHello(const HelloPayload& payload) {
     ByteVector out;
     utils::WriteString(out, payload.nodeId);
@@ -13,6 +17,9 @@ std::vector<std::uint8_t> SerializeHello(const HelloPayload& payload) {
     utils::WriteString(out, payload.observedIpForRemote);
     utils::WriteUint16(out, payload.observedPortForRemote);
     utils::WriteBytes(out, payload.publicKeyBlob);
+    utils::WriteUint16(out, payload.minSupportedVersion);
+    utils::WriteUint16(out, payload.maxSupportedVersion);
+    utils::WriteUint64(out, payload.capabilityFlags);
     return out;
 }
 
@@ -24,6 +31,14 @@ bool DeserializeHello(const ByteVector& data, HelloPayload& payload) {
     if (!utils::ReadString(data, offset, payload.observedIpForRemote)) return false;
     if (!utils::ReadUint16(data, offset, payload.observedPortForRemote)) return false;
     if (!utils::ReadBytes(data, offset, payload.publicKeyBlob)) return false;
+    payload.minSupportedVersion = kProtocolVersion;
+    payload.maxSupportedVersion = kProtocolVersion;
+    payload.capabilityFlags = kCapabilityFileTransferV2 | kCapabilityReplayWindow | kCapabilityJournalReplay;
+    if (offset < data.size()) {
+        if (!utils::ReadUint16(data, offset, payload.minSupportedVersion)) return false;
+        if (!utils::ReadUint16(data, offset, payload.maxSupportedVersion)) return false;
+        if (!utils::ReadUint64(data, offset, payload.capabilityFlags)) return false;
+    }
     return offset == data.size();
 }
 
@@ -61,6 +76,7 @@ bool DeserializePeerList(const ByteVector& data, std::vector<KnownNode>& nodes) 
     std::size_t offset = 0;
     std::uint32_t count = 0;
     if (!utils::ReadUint32(data, offset, count)) return false;
+    if (count > kMaxPeerListEntries) return false;
     nodes.clear();
     nodes.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -323,6 +339,83 @@ bool DeserializeHistorySyncResponse(const ByteVector& data, HistorySyncResponseP
     if (!utils::ReadString(data, offset, payload.responderNodeId)) return false;
     if (!utils::ReadString(data, offset, payload.targetNodeId)) return false;
     if (!utils::ReadBytes(data, offset, payload.messagesBlob)) return false;
+    if (!utils::ReadBytes(data, offset, payload.signature)) return false;
+    return offset == data.size();
+}
+
+
+std::vector<std::uint8_t> SerializePost(const PostPayload& payload) {
+    ByteVector out;
+    utils::WriteString(out, payload.postId);
+    utils::WriteString(out, payload.authorNodeId);
+    utils::WriteString(out, payload.authorNickname);
+    utils::WriteUint64(out, payload.createdAtUnix);
+    utils::WriteString(out, payload.title);
+    utils::WriteString(out, payload.body);
+    utils::WriteBytes(out, payload.authorPublicKeyBlob);
+    utils::WriteBytes(out, payload.signature);
+    utils::WriteUint32(out, payload.relayHopsRemaining);
+    utils::WriteUint32(out, payload.publishDelayMs);
+    utils::WriteUint32(out, payload.hiddenOrigin ? 1u : 0u);
+    return out;
+}
+
+bool DeserializePost(const ByteVector& data, PostPayload& payload) {
+    std::size_t offset = 0;
+    if (!utils::ReadString(data, offset, payload.postId)) return false;
+    if (!utils::ReadString(data, offset, payload.authorNodeId)) return false;
+    if (!utils::ReadString(data, offset, payload.authorNickname)) return false;
+    if (!utils::ReadUint64(data, offset, payload.createdAtUnix)) return false;
+    if (!utils::ReadString(data, offset, payload.title)) return false;
+    if (!utils::ReadString(data, offset, payload.body)) return false;
+    if (!utils::ReadBytes(data, offset, payload.authorPublicKeyBlob)) return false;
+    if (!utils::ReadBytes(data, offset, payload.signature)) return false;
+    if (offset < data.size()) {
+        std::uint32_t hops = 0;
+        std::uint32_t delay = 0;
+        std::uint32_t hidden = 0;
+        if (!utils::ReadUint32(data, offset, hops)) return false;
+        if (!utils::ReadUint32(data, offset, delay)) return false;
+        if (!utils::ReadUint32(data, offset, hidden)) return false;
+        payload.relayHopsRemaining = hops;
+        payload.publishDelayMs = delay;
+        payload.hiddenOrigin = (hidden != 0);
+    }
+    return offset == data.size();
+}
+
+std::vector<std::uint8_t> SerializePostSyncRequest(const PostSyncRequestPayload& payload) {
+    ByteVector out;
+    utils::WriteString(out, payload.requesterNodeId);
+    utils::WriteUint64(out, payload.sinceCreatedAtUnix);
+    utils::WriteUint32(out, payload.maxPosts);
+    utils::WriteBytes(out, payload.signature);
+    return out;
+}
+
+bool DeserializePostSyncRequest(const ByteVector& data, PostSyncRequestPayload& payload) {
+    std::size_t offset = 0;
+    if (!utils::ReadString(data, offset, payload.requesterNodeId)) return false;
+    if (!utils::ReadUint64(data, offset, payload.sinceCreatedAtUnix)) return false;
+    if (!utils::ReadUint32(data, offset, payload.maxPosts)) return false;
+    if (!utils::ReadBytes(data, offset, payload.signature)) return false;
+    return offset == data.size();
+}
+
+std::vector<std::uint8_t> SerializePostSyncResponse(const PostSyncResponsePayload& payload) {
+    ByteVector out;
+    utils::WriteString(out, payload.responderNodeId);
+    utils::WriteString(out, payload.targetNodeId);
+    utils::WriteBytes(out, payload.postsBlob);
+    utils::WriteBytes(out, payload.signature);
+    return out;
+}
+
+bool DeserializePostSyncResponse(const ByteVector& data, PostSyncResponsePayload& payload) {
+    std::size_t offset = 0;
+    if (!utils::ReadString(data, offset, payload.responderNodeId)) return false;
+    if (!utils::ReadString(data, offset, payload.targetNodeId)) return false;
+    if (!utils::ReadBytes(data, offset, payload.postsBlob)) return false;
     if (!utils::ReadBytes(data, offset, payload.signature)) return false;
     return offset == data.size();
 }

@@ -1,0 +1,4 @@
+# TURN servers used by PeerLink relay candidate allocation.
+# Format: host:port
+# Add your production TURN endpoints here.
+# turn.example.com:3478

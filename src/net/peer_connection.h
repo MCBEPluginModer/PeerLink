@@ -41,6 +41,7 @@ public:
     void MarkReceivedActivity();
     bool ShouldSendPing(std::chrono::steady_clock::time_point now, std::chrono::seconds interval);
     bool IsHeartbeatTimedOut(std::chrono::steady_clock::time_point now, std::chrono::seconds timeout) const;
+    std::size_t GetQueuedPacketCount() const;
 
 private:
     void RecvLoop();
@@ -61,7 +62,7 @@ private:
     NodeId remoteNodeId_;
     std::string remoteNickname_;
 
-    std::mutex queueMutex_;
+    mutable std::mutex queueMutex_;
     std::condition_variable queueCv_;
     std::queue<ByteVector> sendQueue_;
 

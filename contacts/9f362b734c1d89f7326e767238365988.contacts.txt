@@ -1,0 +1,1 @@
+# nodeId	nickname	pubkey	fingerprint	trusted	blocked	addedAt	ip	port	preferredRelay

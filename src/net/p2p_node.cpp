@@ -26,6 +26,8 @@
 #include <cctype>
 #include <ctime>
 #include <iostream>
+#include <random>
+#include <thread>
 
 namespace p2p {
 
@@ -44,8 +46,13 @@ P2PNode::P2PNode(std::string nickname, std::uint16_t listenPort) {
     self.observedUdpPort = local_.listenPort;
     self.lastSeen = std::chrono::steady_clock::now();
     knownNodes_.Upsert(self);
+    natClient_ = std::make_unique<nat::StunTurnClient>([this](const std::string& ip, std::uint16_t port, const std::vector<std::uint8_t>& data) {
+        return this->SendStunTurnDatagram(ip, port, data);
+    });
+    LoadNatTraversalConfig();
     LoadContacts();
     LoadOverlayState();
+    LoadPostsFromDisk();
     std::string reputationError;
     if (!peerReputation_.Load(local_.nodeId, &reputationError) && !reputationError.empty()) {
         utils::LogWarn("Failed to load peer reputation store: " + reputationError);
@@ -103,6 +110,84 @@ bool HexToBytesLocal(const std::string& hex, p2p::ByteVector& out) {
     return true;
 }
 
+p2p::ByteVector HexToBytesLocal(const std::string& hex) {
+    p2p::ByteVector out;
+    if (!HexToBytesLocal(hex, out)) {
+        out.clear();
+    }
+    return out;
+}
+
+
+std::string StringToHexLocal(const std::string& value) {
+    return BytesToHexLocal(p2p::ByteVector(value.begin(), value.end()));
+}
+
+bool HexToStringLocal(const std::string& hex, std::string& out) {
+    p2p::ByteVector bytes;
+    if (!HexToBytesLocal(hex, bytes)) return false;
+    out.assign(bytes.begin(), bytes.end());
+    return true;
+}
+
+
+
+std::uint64_t Fnv1aInit() { return 1469598103934665603ull; }
+
+std::uint64_t Fnv1aUpdate(std::uint64_t state, const p2p::ByteVector& data) {
+    for (auto b : data) {
+        state ^= static_cast<std::uint64_t>(b);
+        state *= 1099511628211ull;
+    }
+    return state;
+}
+
+std::string Fnv1aHex(std::uint64_t state) {
+    std::ostringstream oss;
+    oss << std::hex << state;
+    return oss.str();
+}
+
+std::string SanitizeFileName(std::string name) {
+    for (auto& ch : name) {
+        if (ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|') ch = '_';
+    }
+    if (name.empty()) name = "download.bin";
+    return name;
+}
+
+bool ComputeFileFnv64(const fs::path& path, std::uint64_t& sizeOut, std::string& checksumOut) {
+    constexpr std::size_t kHashReadBytes = 64 * 1024;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    sizeOut = 0;
+    std::uint64_t state = Fnv1aInit();
+    p2p::ByteVector buffer(kHashReadBytes);
+    while (in) {
+        in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const auto got = in.gcount();
+        if (got <= 0) break;
+        buffer.resize(static_cast<std::size_t>(got));
+        sizeOut += static_cast<std::uint64_t>(got);
+        state = Fnv1aUpdate(state, buffer);
+        buffer.resize(kHashReadBytes);
+    }
+    checksumOut = Fnv1aHex(state);
+    return true;
+}
+
+std::string CapabilityFlagsToString(std::uint64_t caps) {
+    std::vector<std::string> names;
+    if (caps & p2p::kCapabilityFileTransferV2) names.push_back("file-v2");
+    if (caps & p2p::kCapabilityScenarioTests) names.push_back("scenario-tests");
+    if (caps & p2p::kCapabilityReplayWindow) names.push_back("replay-window");
+    if (caps & p2p::kCapabilityJournalReplay) names.push_back("journal-replay");
+    if (names.empty()) return "none";
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < names.size(); ++i) { if (i) oss << ','; oss << names[i]; }
+    return oss.str();
+}
+
 std::string RelayMsgPath(const fs::path& root, const p2p::NodeId& targetNodeId, p2p::MessageId messageId) {
     return (root / (std::string("msg_") + targetNodeId + "_" + std::to_string(messageId) + ".spool")).string();
 }
@@ -131,8 +216,9 @@ std::string JoinRole(const p2p::GroupRole role) {
     return p2p::ToString(role);
 }
 
-constexpr std::size_t kInlineFileTransferLimit = 256 * 1024;
-constexpr std::size_t kFileChunkBytes = 12 * 1024;
+constexpr std::uint64_t kMaxFileTransferBytes = 10ull * 1024ull * 1024ull * 1024ull;
+constexpr std::size_t kInlineFileTransferLimit = 512 * 1024;
+constexpr std::size_t kFileChunkBytes = 256 * 1024;
 
 std::string ControlMessageKindToString(p2p::P2PNode::ControlMessageKind kind) {
     using K = p2p::P2PNode::ControlMessageKind;
@@ -280,6 +366,32 @@ std::string P2PNode::ResolveDisplayName(const NodeId& peerNodeId, const std::str
     return peerNodeId;
 }
 
+
+
+bool P2PNode::IsBlockedNode(const NodeId& peerNodeId) const {
+    std::lock_guard<std::mutex> lock(contactsMutex_);
+    auto it = contacts_.find(peerNodeId);
+    return it != contacts_.end() && it->second.blocked;
+}
+
+std::string P2PNode::ComputeSafetyNumberForKey(const ByteVector& keyBlob) const {
+    if (keyBlob.empty()) return {};
+    auto hex = ComputeFingerprint(keyBlob);
+    std::string digits;
+    digits.reserve(hex.size());
+    for (char c : hex) {
+        if (std::isxdigit(static_cast<unsigned char>(c))) digits.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    if (digits.empty()) return {};
+    std::string out;
+    for (std::size_t i = 0; i < digits.size(); ++i) {
+        if (i != 0 && (i % 4) == 0) out.push_back('-');
+        out.push_back(digits[i]);
+        if (out.size() >= 24) break;
+    }
+    return out;
+}
+
 void P2PNode::UpsertContactHintsFromKnownNode(const KnownNode& node) {
     bool changed = false;
     {
@@ -319,8 +431,10 @@ bool P2PNode::AddOrUpdateContact(const NodeId& peerNodeId, const std::string& ni
             std::lock_guard<std::mutex> pk(publicKeysMutex_);
             auto it = publicKeys_.find(peerNodeId);
             if (it != publicKeys_.end()) {
+                if (c.publicKeyBlob != it->second) { c.keyVerified = false; c.verifiedAtUnix = 0; }
                 c.publicKeyBlob = it->second;
                 c.fingerprint = ComputeFingerprint(c.publicKeyBlob);
+                c.safetyNumber = ComputeSafetyNumberForKey(c.publicKeyBlob);
             }
         }
         entry = c;
@@ -378,8 +492,10 @@ bool P2PNode::AddContactFromInviteCode(const std::string& inviteCode) {
         else {
             if (!entry.nickname.empty()) c.nickname = entry.nickname;
             if (!entry.publicKeyBlob.empty()) {
+                if (c.publicKeyBlob != entry.publicKeyBlob) { c.keyVerified = false; c.verifiedAtUnix = 0; }
                 c.publicKeyBlob = entry.publicKeyBlob;
                 c.fingerprint = ComputeFingerprint(c.publicKeyBlob);
+                c.safetyNumber = ComputeSafetyNumberForKey(c.publicKeyBlob);
             }
             c.trusted = true;
             c.blocked = false;
@@ -417,6 +533,8 @@ void P2PNode::PrintContacts() const {
             std::cout << " last seen " << secs << "s ago";
         }
         std::cout << (c.trusted ? " trusted" : " untrusted");
+        if (c.blocked) std::cout << " blocked";
+        if (c.keyVerified) std::cout << " verified";
         if (!c.fingerprint.empty()) std::cout << " fp=" << c.fingerprint;
         std::cout << '\n';
     }
@@ -563,6 +681,93 @@ bool P2PNode::UntrustContactByIndex(int index) {
     return true;
 }
 
+bool P2PNode::BlockContactByIndex(int index) {
+    ContactEntry contact{};
+    {
+        std::lock_guard<std::mutex> lock(contactsMutex_);
+        auto ordered = SortedContactsForDisplay(contacts_);
+        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
+        contact = ordered[static_cast<std::size_t>(index - 1)];
+        auto it = contacts_.find(contact.nodeId);
+        if (it != contacts_.end()) it->second.blocked = true;
+    }
+    if (!SaveContacts()) return false;
+    utils::LogSystem("Contact blocked: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
+    return true;
+}
+
+bool P2PNode::UnblockContactByIndex(int index) {
+    ContactEntry contact{};
+    {
+        std::lock_guard<std::mutex> lock(contactsMutex_);
+        auto ordered = SortedContactsForDisplay(contacts_);
+        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
+        contact = ordered[static_cast<std::size_t>(index - 1)];
+        auto it = contacts_.find(contact.nodeId);
+        if (it != contacts_.end()) it->second.blocked = false;
+    }
+    if (!SaveContacts()) return false;
+    utils::LogSystem("Contact unblocked: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
+    return true;
+}
+
+bool P2PNode::VerifyContactKeyByIndex(int index) {
+    ContactEntry contact{};
+    {
+        std::lock_guard<std::mutex> lock(contactsMutex_);
+        auto ordered = SortedContactsForDisplay(contacts_);
+        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
+        contact = ordered[static_cast<std::size_t>(index - 1)];
+        auto it = contacts_.find(contact.nodeId);
+        if (it != contacts_.end()) {
+            it->second.keyVerified = true;
+            it->second.verifiedAtUnix = NowUnix();
+            if (it->second.safetyNumber.empty() && !it->second.publicKeyBlob.empty()) {
+                it->second.safetyNumber = ComputeSafetyNumberForKey(it->second.publicKeyBlob);
+            }
+            contact = it->second;
+        }
+    }
+    if (!SaveContacts()) return false;
+    utils::LogSystem("Contact key verified: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
+    return true;
+}
+
+bool P2PNode::UnverifyContactKeyByIndex(int index) {
+    ContactEntry contact{};
+    {
+        std::lock_guard<std::mutex> lock(contactsMutex_);
+        auto ordered = SortedContactsForDisplay(contacts_);
+        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
+        contact = ordered[static_cast<std::size_t>(index - 1)];
+        auto it = contacts_.find(contact.nodeId);
+        if (it != contacts_.end()) {
+            it->second.keyVerified = false;
+            it->second.verifiedAtUnix = 0;
+            contact = it->second;
+        }
+    }
+    if (!SaveContacts()) return false;
+    utils::LogSystem("Contact key verification cleared: " + (contact.nickname.empty() ? contact.nodeId : contact.nickname));
+    return true;
+}
+
+bool P2PNode::PrintSafetyNumberByIndex(int index) const {
+    ContactEntry contact{};
+    {
+        std::lock_guard<std::mutex> lock(contactsMutex_);
+        auto ordered = SortedContactsForDisplay(contacts_);
+        if (index <= 0 || index > static_cast<int>(ordered.size())) return false;
+        contact = ordered[static_cast<std::size_t>(index - 1)];
+    }
+    std::string safety = contact.safetyNumber;
+    if (safety.empty() && !contact.publicKeyBlob.empty()) safety = ComputeSafetyNumberForKey(contact.publicKeyBlob);
+    if (safety.empty()) return false;
+    utils::LogRaw("Safety number for " + (contact.nickname.empty() ? contact.nodeId : contact.nickname) + ": " + safety);
+    return true;
+}
+
+
 bool P2PNode::InitWinSock() {
     if (winsockInitialized_) return true;
     WSADATA wsa{};
@@ -628,6 +833,7 @@ bool P2PNode::Start() {
     ResumePendingFlows();
     LoadRelaySpoolFromDisk();
     LoadMessageJournalFromDisk();
+    LoadReplayCacheFromDisk();
     LoadBootstrapNodes();
 
     listenSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -689,6 +895,7 @@ void P2PNode::Stop() {
     if (udpThread_.joinable()) udpThread_.join();
 
     SaveMessageJournalToDisk();
+    SaveReplayCacheToDisk();
     { std::lock_guard<std::mutex> repLock(reputationMutex_); std::string repError; peerReputation_.Save(local_.nodeId, &repError); }
 
     signer_.Cleanup();
@@ -733,6 +940,27 @@ void P2PNode::AcceptLoop() {
         auto ip = utils::SocketAddressToIp(addr);
         auto port = ntohs(addr.sin_port);
 
+        bool reject = false;
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            if (pendingPeers_.size() >= maxPendingHandshakes_) reject = true;
+        }
+        {
+            const auto now = NowUnix();
+            std::lock_guard<std::mutex> guard(handshakeGuardMutex_);
+            auto& q = incomingHandshakeAttemptsByIp_[ip];
+            while (!q.empty() && (now - q.front()) > handshakeWindowSeconds_) q.pop_front();
+            q.push_back(now);
+            if (q.size() > maxHandshakeAttemptsPerIpWindow_) reject = true;
+        }
+        if (reject) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.handshakeFloodRejects; }
+            utils::LogWarn("Rejected incoming handshake connection from " + ip + ":" + std::to_string(port) + " due to flood guard");
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+            continue;
+        }
+
         auto peer = std::make_shared<PeerConnection>(this, client, ip, port, true);
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -740,6 +968,24 @@ void P2PNode::AcceptLoop() {
         }
         peer->Start();
         utils::LogSystem("Incoming connection: " + ip + ":" + std::to_string(port));
+    }
+}
+
+void P2PNode::CleanupPendingHandshakes() {
+    std::vector<std::shared_ptr<PeerConnection>> expired;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        for (const auto& [_, peer] : pendingPeers_) {
+            if (peer && !peer->IsActive() && peer->IsHeartbeatTimedOut(now, std::chrono::seconds(handshakeTimeoutSeconds_))) {
+                expired.push_back(peer);
+            }
+        }
+    }
+    for (auto& peer : expired) {
+        { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.handshakeRejects; }
+        utils::LogWarn("Closing pending handshake due to timeout from " + peer->GetRemoteIp());
+        SafeClosePeer(peer);
     }
 }
 
@@ -751,6 +997,8 @@ void P2PNode::DiscoveryLoop() {
         BroadcastPeerListToAll();
         RunHeartbeatChecks();
         CleanupExpiredRelayQueues();
+        CleanupPendingHandshakes();
+        FlushReplayCacheIfDirty();
         SendUdpProbeToKnownNodes();
         TryAutoConnectKnownNodes();
         TryConnectBootstrapNodes();
@@ -758,6 +1006,7 @@ void P2PNode::DiscoveryLoop() {
         ReplayJournalEntries();
         TickProtocolFlows();
         TickFileTransfers();
+        TickNatTraversalServices();
     }
 }
 
@@ -769,6 +1018,9 @@ void P2PNode::SendHello(const std::shared_ptr<PeerConnection>& peer) {
     hello.observedIpForRemote.clear();
     hello.observedPortForRemote = 0;
     signer_.ExportPublicKey(hello.publicKeyBlob);
+    hello.minSupportedVersion = kProtocolVersion;
+    hello.maxSupportedVersion = kProtocolVersion;
+    hello.capabilityFlags = GetLocalCapabilityFlags();
 
     auto body = protocol::SerializeHello(hello);
     auto packet = protocol::MakePacket(PacketType::Hello, utils::GeneratePacketId(), body);
@@ -783,6 +1035,9 @@ void P2PNode::SendHelloAck(const std::shared_ptr<PeerConnection>& peer) {
     hello.observedIpForRemote = peer->GetRemoteIp();
     hello.observedPortForRemote = peer->GetRemotePort();
     signer_.ExportPublicKey(hello.publicKeyBlob);
+    hello.minSupportedVersion = kProtocolVersion;
+    hello.maxSupportedVersion = kProtocolVersion;
+    hello.capabilityFlags = GetLocalCapabilityFlags();
 
     auto body = protocol::SerializeHello(hello);
     auto packet = protocol::MakePacket(PacketType::HelloAck, utils::GeneratePacketId(), body);
@@ -879,6 +1134,7 @@ bool P2PNode::CheckIncomingRateLimit(const std::shared_ptr<PeerConnection>& peer
         ++state.violations;
         if (state.violations == 1 || state.violations % 5 == 0) {
             const auto remote = peer->GetRemoteNickname().empty() ? peer->GetRemoteNodeId() : peer->GetRemoteNickname();
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.rateLimitHits; }
             utils::LogError("Rate limit exceeded for peer: " + remote);
             if (!peer->GetRemoteNodeId().empty()) {
                 std::lock_guard<std::mutex> repLock(reputationMutex_);
@@ -929,6 +1185,9 @@ void P2PNode::OnPacket(const std::shared_ptr<PeerConnection>& peer, PacketType t
         case PacketType::RelayMessageAck: HandleRelayMessageAck(peer, packetId, payload); break;
         case PacketType::HistorySyncRequest: HandleHistorySyncRequest(peer, packetId, payload); break;
         case PacketType::HistorySyncResponse: HandleHistorySyncResponse(peer, packetId, payload); break;
+        case PacketType::PostMessage: HandlePost(peer, packetId, payload); break;
+        case PacketType::PostSyncRequest: HandlePostSyncRequest(peer, packetId, payload); break;
+        case PacketType::PostSyncResponse: HandlePostSyncResponse(peer, packetId, payload); break;
         default: break;
     }
 }
@@ -952,7 +1211,26 @@ bool P2PNode::FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& 
     if (!peer) return false;
     if (hello.nodeId == local_.nodeId) { SafeClosePeer(peer); return false; }
 
+    std::string compatReason;
+    if (!IsCompatibleHello(hello, &compatReason)) {
+        utils::LogWarn("Rejected handshake from " + hello.nodeId + ": " + compatReason);
+        SafeClosePeer(peer);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(handshakeGuardMutex_);
+        auto itCooldown = blockedHandshakeUntilByNodeId_.find(hello.nodeId);
+        if (itCooldown != blockedHandshakeUntilByNodeId_.end() && NowUnix() < itCooldown->second) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.handshakeRejects; }
+            utils::LogWarn("Rejected handshake during cooldown from " + hello.nodeId);
+            SafeClosePeer(peer);
+            return false;
+        }
+    }
+
     peer->SetRemoteIdentity(hello.nodeId, hello.nickname, hello.listenPort);
+    utils::LogDebug("Handshake negotiated caps with " + hello.nodeId + ": " + CapabilityFlagsToString(hello.capabilityFlags));
 
     {
         std::lock_guard<std::mutex> lock(publicKeysMutex_);
@@ -977,7 +1255,13 @@ bool P2PNode::FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& 
     {
         std::lock_guard<std::mutex> repLock(reputationMutex_);
         if (peerReputation_.ShouldBlock(hello.nodeId)) {
+            {
+                std::lock_guard<std::mutex> guard(handshakeGuardMutex_);
+                blockedHandshakeUntilByNodeId_[hello.nodeId] = NowUnix() + blockedHandshakeCooldownSeconds_;
+            }
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.handshakeRejects; }
             utils::LogWarn("Blocking handshake from low-reputation peer: " + hello.nodeId);
+            SafeClosePeer(peer);
             return false;
         }
     }
@@ -1025,6 +1309,7 @@ bool P2PNode::FinalizePeerAfterHandshake(const std::shared_ptr<PeerConnection>& 
     FlushRelayQueueForTarget(hello.nodeId);
     FlushRelayAckQueueForTarget(hello.nodeId);
     RequestHistorySync(hello.nodeId);
+    RequestPostSync(hello.nodeId);
     bool shouldMirrorDevice = false;
     {
         std::lock_guard<std::mutex> lock(overlayMutex_);
@@ -1170,6 +1455,218 @@ ByteVector P2PNode::BuildHistorySyncResponseSignedData(const HistorySyncResponse
     return out;
 }
 
+ByteVector P2PNode::BuildPostSignedData(const PostPayload& p) const {
+    ByteVector out;
+    utils::WriteString(out, p.postId);
+    utils::WriteString(out, p.authorNodeId);
+    utils::WriteString(out, p.authorNickname);
+    utils::WriteUint64(out, p.createdAtUnix);
+    utils::WriteString(out, p.title);
+    utils::WriteString(out, p.body);
+    return out;
+}
+
+ByteVector P2PNode::BuildPostSyncRequestSignedData(const PostSyncRequestPayload& p) const {
+    ByteVector out;
+    utils::WriteString(out, p.requesterNodeId);
+    utils::WriteUint64(out, p.sinceCreatedAtUnix);
+    utils::WriteUint32(out, p.maxPosts);
+    return out;
+}
+
+ByteVector P2PNode::BuildPostSyncResponseSignedData(const PostSyncResponsePayload& p) const {
+    ByteVector out;
+    utils::WriteString(out, p.responderNodeId);
+    utils::WriteString(out, p.targetNodeId);
+    utils::WriteBytes(out, p.postsBlob);
+    return out;
+}
+
+namespace {
+ByteVector BuildPostsBlob(const std::vector<p2p::PostPayload>& posts) {
+    p2p::ByteVector out;
+    p2p::utils::WriteUint32(out, static_cast<std::uint32_t>(posts.size()));
+    for (const auto& post : posts) {
+        auto item = p2p::protocol::SerializePost(post);
+        p2p::utils::WriteBytes(out, item);
+    }
+    return out;
+}
+
+bool ParsePostsBlob(const p2p::ByteVector& blob, std::vector<p2p::PostPayload>& posts) {
+    std::size_t offset = 0;
+    std::uint32_t count = 0;
+    if (!p2p::utils::ReadUint32(blob, offset, count)) return false;
+    if (count > 2048) return false;
+    posts.clear();
+    posts.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        p2p::ByteVector item;
+        if (!p2p::utils::ReadBytes(blob, offset, item)) return false;
+        p2p::PostPayload post{};
+        if (!p2p::protocol::DeserializePost(item, post)) return false;
+        posts.push_back(std::move(post));
+    }
+    return offset == blob.size();
+}
+}
+
+void P2PNode::RequestPostSync(const NodeId& peerNodeId) {
+    if (peerNodeId.empty()) return;
+    PostSyncRequestPayload req{};
+    req.requesterNodeId = local_.nodeId;
+    req.maxPosts = 512;
+    {
+        std::lock_guard<std::mutex> lock(postsMutex_);
+        if (!postsFeed_.empty()) req.sinceCreatedAtUnix = postsFeed_.front().createdAtUnix;
+    }
+    if (!signer_.Sign(BuildPostSyncRequestSignedData(req), req.signature)) return;
+    auto body = protocol::SerializePostSyncRequest(req);
+    auto packet = protocol::MakePacket(PacketType::PostSyncRequest, utils::GeneratePacketId(), body);
+    auto peer = peerManager_.FindByNodeId(peerNodeId);
+    if (peer) peer->EnqueuePacket(packet);
+}
+
+std::vector<std::shared_ptr<PeerConnection>> P2PNode::SelectRelayPeers(std::size_t maxPeers, const NodeId& excludeNodeId) const {
+    auto peers = peerManager_.GetAllPeers();
+    std::vector<std::shared_ptr<PeerConnection>> filtered;
+    filtered.reserve(peers.size());
+    for (auto& p : peers) {
+        if (!p) continue;
+        const auto remote = p->GetRemoteNodeId();
+        if (!excludeNodeId.empty() && remote == excludeNodeId) continue;
+        filtered.push_back(p);
+    }
+    if (filtered.empty()) return filtered;
+    std::mt19937 rng(static_cast<unsigned int>(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::shuffle(filtered.begin(), filtered.end(), rng);
+    if (filtered.size() > maxPeers) filtered.resize(maxPeers);
+    return filtered;
+}
+
+void P2PNode::RepropagatePostWithDelay(PostPayload payload, PacketId packetId, const NodeId& excludeNodeId) {
+    std::thread([this, payload = std::move(payload), packetId, excludeNodeId]() mutable {
+        const std::uint32_t delayMs = payload.publishDelayMs == 0 ? 600u : payload.publishDelayMs;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        RoutePublishedPost(payload, packetId, excludeNodeId);
+    }).detach();
+}
+
+void P2PNode::RoutePublishedPost(const PostPayload& payload, PacketId packetId, const NodeId& excludeNodeId) {
+    auto routed = payload;
+    if (routed.hiddenOrigin && routed.relayHopsRemaining > 0) {
+        routed.relayHopsRemaining--;
+        auto body = protocol::SerializePost(routed);
+        auto packet = protocol::MakePacket(PacketType::PostMessage, packetId, body);
+        auto relays = SelectRelayPeers(1, excludeNodeId);
+        for (auto& peer : relays) {
+            peer->EnqueuePacket(packet);
+        }
+        return;
+    }
+
+    auto body = protocol::SerializePost(routed);
+    auto packet = protocol::MakePacket(PacketType::PostMessage, packetId, body);
+    BroadcastRaw(packet, excludeNodeId);
+}
+
+void P2PNode::HandlePostSyncRequest(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload) {
+    if (!router_.MarkSeen(packetId)) return;
+    PostSyncRequestPayload req{};
+    if (!protocol::DeserializePostSyncRequest(payload, req)) return;
+    if (req.requesterNodeId.empty()) return;
+    if (IsBlockedNode(req.requesterNodeId)) return;
+
+    ByteVector pub;
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        auto it = publicKeys_.find(req.requesterNodeId);
+        if (it != publicKeys_.end()) pub = it->second;
+    }
+    if (!pub.empty() && !signer_.Verify(BuildPostSyncRequestSignedData(req), req.signature, pub)) return;
+
+    std::vector<PostPayload> selected;
+    {
+        std::lock_guard<std::mutex> lock(postsMutex_);
+        const std::size_t maxPosts = std::min<std::size_t>(req.maxPosts == 0 ? maxPostSyncPostsPerResponse_ : req.maxPosts, maxPostSyncPostsPerResponse_);
+        selected.reserve(std::min<std::size_t>(postsFeed_.size(), maxPosts));
+        for (const auto& rec : postsFeed_) {
+            if (rec.createdAtUnix <= req.sinceCreatedAtUnix) continue;
+            PostPayload post{};
+            post.postId = rec.postId;
+            post.authorNodeId = rec.authorNodeId;
+            post.authorNickname = rec.authorNickname;
+            post.createdAtUnix = rec.createdAtUnix;
+            post.title = rec.title;
+            post.body = rec.body;
+            post.authorPublicKeyBlob = rec.authorPublicKeyBlob;
+            post.signature = rec.signature;
+            selected.push_back(std::move(post));
+            if (selected.size() >= std::min<std::size_t>(req.maxPosts == 0 ? maxPostSyncPostsPerResponse_ : req.maxPosts, maxPostSyncPostsPerResponse_)) break;
+        }
+    }
+    if (selected.empty()) return;
+
+    PostSyncResponsePayload resp{};
+    resp.responderNodeId = local_.nodeId;
+    resp.targetNodeId = req.requesterNodeId;
+    resp.postsBlob = BuildPostsBlob(selected);
+    if (resp.postsBlob.size() > maxPostSyncBlobBytes_) { utils::LogWarn("PostSyncResponse truncated by anti-abuse size cap"); return; }
+    if (!signer_.Sign(BuildPostSyncResponseSignedData(resp), resp.signature)) return;
+    auto body = protocol::SerializePostSyncResponse(resp);
+    auto packet = protocol::MakePacket(PacketType::PostSyncResponse, utils::GeneratePacketId(), body);
+    if (peer) peer->EnqueuePacket(packet);
+}
+
+void P2PNode::HandlePostSyncResponse(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload) {
+    if (!router_.MarkSeen(packetId)) return;
+    PostSyncResponsePayload resp{};
+    if (!protocol::DeserializePostSyncResponse(payload, resp)) return;
+    if (resp.targetNodeId != local_.nodeId) return;
+    if (IsBlockedNode(resp.responderNodeId)) return;
+
+    ByteVector pub;
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        auto it = publicKeys_.find(resp.responderNodeId);
+        if (it != publicKeys_.end()) pub = it->second;
+    }
+    if (!pub.empty() && !signer_.Verify(BuildPostSyncResponseSignedData(resp), resp.signature, pub)) return;
+
+    std::vector<PostPayload> posts;
+    if (!ParsePostsBlob(resp.postsBlob, posts)) return;
+
+    std::size_t imported = 0;
+    for (const auto& post : posts) {
+        if (post.postId.empty() || post.authorNodeId.empty() || post.title.empty() || post.body.empty()) continue;
+        ByteVector authorPub = post.authorPublicKeyBlob;
+        {
+            std::lock_guard<std::mutex> lock(publicKeysMutex_);
+            auto it = publicKeys_.find(post.authorNodeId);
+            if (it != publicKeys_.end() && !it->second.empty()) authorPub = it->second;
+            else if (!post.authorPublicKeyBlob.empty()) publicKeys_[post.authorNodeId] = post.authorPublicKeyBlob;
+        }
+        const bool verified = !authorPub.empty() && signer_.Verify(BuildPostSignedData(post), post.signature, authorPub);
+        if (!verified) continue;
+        bool shouldStore = false;
+        {
+            std::lock_guard<std::mutex> lock(postsMutex_);
+            if (!knownPostIds_.count(post.postId)) {
+                knownPostIds_.insert(post.postId);
+                postsFeed_.insert(postsFeed_.begin(), PublicPostRecord{post.postId, post.authorNodeId, post.authorNickname, post.createdAtUnix, post.title, post.body, post.authorPublicKeyBlob, post.signature, true});
+                shouldStore = true;
+            }
+        }
+        if (shouldStore) {
+            SavePostToDisk(post, true);
+            ++imported;
+        }
+    }
+    if (imported != 0) {
+        utils::LogSystem("Imported " + std::to_string(imported) + " post(s) from " + resp.responderNodeId);
+    }
+}
+
 void P2PNode::SendInvite(const NodeId& targetNodeId) {
     InviteRequestPayload payload{};
     payload.inviteId = utils::GeneratePacketId();
@@ -1217,6 +1714,7 @@ void P2PNode::HandleInviteRequest(const std::shared_ptr<PeerConnection>& peer, P
     }
 
     if (p.toNodeId == local_.nodeId) {
+        if (IsBlockedNode(p.fromNodeId)) { utils::LogWarn("Dropped invite from blocked contact: " + p.fromNodeId); return; }
         PendingInvite inv{p.inviteId, p.fromNodeId, p.fromNickname, p.toNodeId};
         {
             std::lock_guard<std::mutex> lock(invitesMutex_);
@@ -1314,6 +1812,7 @@ void P2PNode::HandleInviteAccept(const std::shared_ptr<PeerConnection>& peer, Pa
     }
 
     if (p.toNodeId == local_.nodeId) {
+        if (IsBlockedNode(p.fromNodeId)) { utils::LogWarn("Dropped invite from blocked contact: " + p.fromNodeId); return; }
         {
             std::lock_guard<std::mutex> lock(invitesMutex_);
             outgoingInvites_.erase(p.inviteId);
@@ -1357,6 +1856,189 @@ void P2PNode::BroadcastChat(const std::string& text) {
     utils::LogGlobal(local_.nickname, text);
     BroadcastRaw(packet);
 }
+
+bool P2PNode::SavePostToDisk(const PostPayload& payload, bool signatureVerified) {
+    try {
+        const fs::path dir = fs::path(postsRootDir_);
+        fs::create_directories(dir);
+        const fs::path path = dir / (local_.nodeId + ".feed.tsv");
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        if (!out) return false;
+        out << payload.createdAtUnix << '\t'
+            << StringToHexLocal(payload.postId) << '\t'
+            << StringToHexLocal(payload.authorNodeId) << '\t'
+            << StringToHexLocal(payload.authorNickname) << '\t'
+            << (signatureVerified ? "1" : "0") << '\t'
+            << BytesToHexLocal(payload.authorPublicKeyBlob) << '\t'
+            << BytesToHexLocal(payload.signature) << '\t'
+            << StringToHexLocal(payload.title) << '\t'
+            << StringToHexLocal(payload.body) << '\n';
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void P2PNode::LoadPostsFromDisk() {
+    try {
+        const fs::path path = fs::path(postsRootDir_) / (local_.nodeId + ".feed.tsv");
+        if (!fs::exists(path)) return;
+        std::ifstream in(path, std::ios::binary);
+        std::string line;
+        std::vector<PublicPostRecord> loaded;
+        std::unordered_set<std::string> ids;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            std::vector<std::string> parts;
+            std::stringstream ss(line);
+            std::string part;
+            while (std::getline(ss, part, '\t')) parts.push_back(part);
+            if (parts.size() < 9) continue;
+            PublicPostRecord rec{};
+            try { rec.createdAtUnix = static_cast<std::uint64_t>(std::stoull(parts[0])); } catch (...) { continue; }
+            if (!HexToStringLocal(parts[1], rec.postId) || rec.postId.empty()) continue;
+            if (ids.count(rec.postId)) continue;
+            if (!HexToStringLocal(parts[2], rec.authorNodeId)) continue;
+            if (!HexToStringLocal(parts[3], rec.authorNickname)) rec.authorNickname.clear();
+            rec.signatureVerified = (parts[4] == "1");
+            rec.authorPublicKeyBlob = HexToBytesLocal(parts[5]);
+            rec.signature = HexToBytesLocal(parts[6]);
+            if (!HexToStringLocal(parts[7], rec.title)) rec.title.clear();
+            if (!HexToStringLocal(parts[8], rec.body)) rec.body.clear();
+            loaded.push_back(std::move(rec));
+            ids.insert(loaded.back().postId);
+        }
+        std::sort(loaded.begin(), loaded.end(), [](const PublicPostRecord& a, const PublicPostRecord& b) {
+            if (a.createdAtUnix != b.createdAtUnix) return a.createdAtUnix > b.createdAtUnix;
+            return a.postId > b.postId;
+        });
+        std::lock_guard<std::mutex> lock(postsMutex_);
+        postsFeed_ = std::move(loaded);
+        knownPostIds_ = std::move(ids);
+    } catch (...) {
+    }
+}
+
+bool P2PNode::PublishPost(const std::string& title, const std::string& body) {
+    const auto trimmedTitle = TrimCopy(title);
+    const auto trimmedBody = TrimCopy(body);
+    if (trimmedTitle.empty()) {
+        utils::LogError("Post title is empty");
+        return false;
+    }
+    if (trimmedBody.empty()) {
+        utils::LogError("Post body is empty");
+        return false;
+    }
+    if (trimmedTitle.size() > maxPostTitleBytes_) {
+        utils::LogError("Post title exceeds anti-abuse limit");
+        return false;
+    }
+    if (trimmedBody.size() > maxPostBodyBytes_) {
+        utils::LogError("Post body exceeds anti-abuse limit");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(postPublishRateMutex_);
+        const auto now = NowUnix();
+        while (!localPostPublishTimes_.empty() && (now - localPostPublishTimes_.front()) > 60) localPostPublishTimes_.pop_front();
+        if (localPostPublishTimes_.size() >= maxPostPublishesPerMinute_) {
+            utils::LogError("Post publish rate limit exceeded");
+            return false;
+        }
+        localPostPublishTimes_.push_back(now);
+    }
+    PostPayload payload{};
+    payload.postId = local_.nodeId + "-" + std::to_string(utils::GeneratePacketId());
+    payload.authorNodeId = local_.nodeId;
+    payload.authorNickname = local_.nickname;
+    payload.createdAtUnix = static_cast<std::uint64_t>(NowUnix());
+    payload.title = trimmedTitle;
+    payload.body = trimmedBody;
+    payload.authorPublicKeyBlob = localPublicKeyBlob_;
+    payload.hiddenOrigin = true;
+    payload.relayHopsRemaining = 2u + static_cast<std::uint32_t>(utils::GeneratePacketId() % 3u);
+    payload.publishDelayMs = 500u + static_cast<std::uint32_t>(utils::GeneratePacketId() % 1500u);
+    if (!signer_.Sign(BuildPostSignedData(payload), payload.signature)) {
+        utils::LogError("Failed to sign post");
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(postsMutex_);
+        if (knownPostIds_.count(payload.postId)) return true;
+        knownPostIds_.insert(payload.postId);
+        postsFeed_.insert(postsFeed_.begin(), PublicPostRecord{payload.postId, payload.authorNodeId, payload.authorNickname, payload.createdAtUnix, payload.title, payload.body, payload.authorPublicKeyBlob, payload.signature, true});
+    }
+    SavePostToDisk(payload, true);
+    const PacketId packetId = utils::GeneratePacketId();
+    router_.MarkSeen(packetId);
+    utils::LogSystem("Published post via origin-hiding relay path: " + payload.postId);
+    RoutePublishedPost(payload, packetId);
+    return true;
+}
+
+void P2PNode::PrintPosts(std::size_t limit) const {
+    std::lock_guard<std::mutex> lock(postsMutex_);
+    utils::LogRaw("=== Public posts ===");
+    if (postsFeed_.empty()) {
+        utils::LogRaw("  (empty)");
+        return;
+    }
+    const std::size_t count = std::min(limit, postsFeed_.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& post = postsFeed_[i];
+        const std::string name = post.authorNickname.empty() ? post.authorNodeId : post.authorNickname;
+        utils::LogRaw("[" + std::to_string(i + 1) + "] " + name + " | id=" + post.postId +
+                      " | verified=" + std::string(post.signatureVerified ? "yes" : "no"));
+        utils::LogRaw("    Title: " + post.title);
+        utils::LogRaw("    Body: " + post.body);
+    }
+}
+
+void P2PNode::HandlePost(const std::shared_ptr<PeerConnection>& peer, PacketId packetId, const ByteVector& payload) {
+    if (!router_.MarkSeen(packetId)) return;
+    PostPayload post{};
+    if (!protocol::DeserializePost(payload, post)) return;
+    if (post.postId.empty() || post.authorNodeId.empty() || post.title.empty() || post.body.empty()) return;
+    if (IsBlockedNode(post.authorNodeId)) return;
+
+    ByteVector pub = post.authorPublicKeyBlob;
+    {
+        std::lock_guard<std::mutex> lock(publicKeysMutex_);
+        auto it = publicKeys_.find(post.authorNodeId);
+        if (it != publicKeys_.end() && !it->second.empty()) pub = it->second;
+        else if (!post.authorPublicKeyBlob.empty()) publicKeys_[post.authorNodeId] = post.authorPublicKeyBlob;
+    }
+    const bool verified = !pub.empty() && signer_.Verify(BuildPostSignedData(post), post.signature, pub);
+    if (!verified) {
+        utils::LogWarn("Rejected unsigned or invalid public post from " + post.authorNodeId);
+        return;
+    }
+
+    bool shouldStore = false;
+    {
+        std::lock_guard<std::mutex> lock(postsMutex_);
+        if (!knownPostIds_.count(post.postId)) {
+            knownPostIds_.insert(post.postId);
+            postsFeed_.insert(postsFeed_.begin(), PublicPostRecord{post.postId, post.authorNodeId, post.authorNickname, post.createdAtUnix, post.title, post.body, post.authorPublicKeyBlob, post.signature, true});
+            shouldStore = true;
+        }
+    }
+    if (shouldStore) {
+        SavePostToDisk(post, true);
+        utils::LogRaw("[Post] " + (post.authorNickname.empty() ? post.authorNodeId : post.authorNickname));
+        utils::LogRaw("  Title: " + post.title);
+        utils::LogRaw("  Body: " + post.body);
+    }
+    const NodeId excludeNodeId = peer ? peer->GetRemoteNodeId() : "";
+    if (post.hiddenOrigin || post.relayHopsRemaining > 0) {
+        RepropagatePostWithDelay(post, packetId, excludeNodeId);
+    } else {
+        auto packet = protocol::MakePacket(PacketType::PostMessage, packetId, payload);
+        BroadcastRaw(packet, excludeNodeId);
+    }
+}
+
 
 void P2PNode::RejectInvite(const NodeId& fromNodeId, const std::string& reason) {
     auto inviteOpt = FindIncomingInviteByFromNodeId(fromNodeId);
@@ -1409,6 +2091,7 @@ void P2PNode::HandleInviteReject(const std::shared_ptr<PeerConnection>& peer, Pa
     }
 
     if (p.toNodeId == local_.nodeId) {
+        if (IsBlockedNode(p.fromNodeId)) { utils::LogWarn("Dropped invite from blocked contact: " + p.fromNodeId); return; }
         {
             std::lock_guard<std::mutex> lock(invitesMutex_);
             outgoingInvites_.erase(p.inviteId);
@@ -1422,6 +2105,7 @@ void P2PNode::HandleInviteReject(const std::shared_ptr<PeerConnection>& peer, Pa
 }
 
 void P2PNode::SendPrivateMessage(const NodeId& targetNodeId, const std::string& text) {
+    if (IsBlockedNode(targetNodeId)) { utils::LogError("Cannot send private message to blocked contact"); return; }
     auto sessionIdOpt = FindSessionByPeer(targetNodeId);
     if (!sessionIdOpt) { utils::LogError("No private session with this user"); return; }
 
@@ -1488,6 +2172,7 @@ void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, 
     }
 
     if (p.toNodeId != local_.nodeId) return;
+    if (IsBlockedNode(p.fromNodeId)) { utils::LogWarn("Dropped private message from blocked contact: " + p.fromNodeId); return; }
     ByteVector sessionKey;
     if (!GetSessionKeyForPeer(p.fromNodeId, sessionKey)) {
         utils::LogError("Missing E2E session key for incoming private message");
@@ -1495,6 +2180,11 @@ void P2PNode::HandlePrivateMessage(const std::shared_ptr<PeerConnection>& peer, 
     }
     if (!DecryptPrivateMessagePayload(p, sessionKey)) {
         utils::LogError("Failed to decrypt private message");
+        return;
+    }
+    if (!MarkRecentIncomingMessage(p.messageId)) {
+        utils::LogWarn("Dropped replay/duplicate private message: id=" + std::to_string(p.messageId));
+        SendDeliveryAck(p, 0);
         return;
     }
     BufferOrDeliverIncomingPrivateMessage(p, pub, 0, true);
@@ -1579,6 +2269,11 @@ void P2PNode::QueueRelayMessage(const RelayPrivateMessagePayload& payload) {
     {
         std::lock_guard<std::mutex> lock(relayMutex_);
         auto& q = relayQueuesByTarget_[payload.finalTargetNodeId];
+        if (q.size() >= maxRelayQueuePerTarget_) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.relayQueuePressureEvents; ++metrics_.relayQueueDrops; }
+            utils::LogWarn("Dropping relay message due to queue cap for target " + payload.finalTargetNodeId);
+            return;
+        }
         for (const auto& existing : q) {
             if (existing.relayPacketId == payload.relayPacketId || existing.messageId == inner.messageId) return;
         }
@@ -1603,6 +2298,11 @@ void P2PNode::QueueRelayAck(const RelayMessageAckPayload& payload) {
     {
         std::lock_guard<std::mutex> lock(relayMutex_);
         auto& q = relayAckQueuesByTarget_[payload.finalTargetNodeId];
+        if (q.size() >= maxRelayQueuePerTarget_) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.relayQueuePressureEvents; ++metrics_.relayQueueDrops; }
+            utils::LogWarn("Dropping relay ACK due to queue cap for target " + payload.finalTargetNodeId);
+            return;
+        }
         for (const auto& existing : q) {
             if (existing.relayPacketId == payload.relayPacketId || existing.messageId == inner.messageId) return;
         }
@@ -1645,6 +2345,10 @@ void P2PNode::FlushRelayQueueForTarget(const NodeId& targetNodeId) {
     }
 
     for (const auto& msg : pending) {
+        if (msg.attemptCount >= relayRetryBudgetPerTarget_) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.relayRetryBudgetDrops; }
+            continue;
+        }
         RelayPrivateMessagePayload relay{};
         relay.relayPacketId = msg.relayPacketId;
         relay.relayFromNodeId = msg.relayFromNodeId;
@@ -1684,6 +2388,10 @@ void P2PNode::FlushRelayAckQueueForTarget(const NodeId& targetNodeId) {
     }
 
     for (const auto& msg : pending) {
+        if (msg.attemptCount >= relayRetryBudgetPerTarget_) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.relayRetryBudgetDrops; }
+            continue;
+        }
         RelayMessageAckPayload relay{};
         relay.relayPacketId = msg.relayPacketId;
         relay.relayFromNodeId = msg.relayFromNodeId;
@@ -1968,6 +2676,94 @@ void P2PNode::LoadRelaySpoolFromDisk() {
 }
 
 
+bool P2PNode::SaveReplayCacheToDisk() const {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(replayCacheRootDir_, ec);
+    const fs::path path = fs::path(replayCacheRootDir_) / (local_.nodeId + ".cache");
+    const fs::path tempPath = path.string() + ".tmp";
+    std::deque<MessageId> msgOrder;
+    std::deque<std::string> ctrlOrder;
+    {
+        std::lock_guard<std::mutex> lock(replayMutex_);
+        msgOrder = recentIncomingMessageOrder_;
+        ctrlOrder = recentControlReplayOrder_;
+    }
+    while (msgOrder.size() > maxRecentIncomingMessageIds_) msgOrder.pop_front();
+    while (ctrlOrder.size() > maxRecentControlReplayKeys_) ctrlOrder.pop_front();
+
+    std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << "MSG\n";
+    for (const auto& id : msgOrder) out << id << "\n";
+    out << "CTRL\n";
+    for (const auto& key : ctrlOrder) out << key << "\n";
+    out.close();
+    fs::rename(tempPath, path, ec);
+    if (ec) {
+        fs::remove(path, ec);
+        ec.clear();
+        fs::rename(tempPath, path, ec);
+    }
+    if (ec) {
+        std::error_code ignore; fs::remove(tempPath, ignore);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(replayMutex_);
+        replayCacheDirty_ = false;
+        replayCacheLastFlushUnix_ = NowUnix();
+    }
+    return true;
+}
+
+void P2PNode::FlushReplayCacheIfDirty() const {
+    bool shouldFlush = false;
+    {
+        std::lock_guard<std::mutex> lock(replayMutex_);
+        shouldFlush = replayCacheDirty_ && (replayCacheLastFlushUnix_ == 0 || (NowUnix() - replayCacheLastFlushUnix_) >= 5);
+    }
+    if (shouldFlush) SaveReplayCacheToDisk();
+}
+
+void P2PNode::LoadReplayCacheFromDisk() {
+    namespace fs = std::filesystem;
+    std::ifstream in(fs::path(replayCacheRootDir_) / (local_.nodeId + ".cache"), std::ios::binary);
+    if (!in) return;
+    std::lock_guard<std::mutex> lock(replayMutex_);
+    recentIncomingMessageIds_.clear();
+    recentIncomingMessageOrder_.clear();
+    recentControlReplayKeys_.clear();
+    recentControlReplayOrder_.clear();
+    replayCacheDirty_ = false;
+    replayCacheLastFlushUnix_ = NowUnix();
+    std::string line;
+    enum class Section { None, Msg, Ctrl } sec = Section::None;
+    while (std::getline(in, line)) {
+        if (line == "MSG") { sec = Section::Msg; continue; }
+        if (line == "CTRL") { sec = Section::Ctrl; continue; }
+        if (line.empty()) continue;
+        try {
+            if (sec == Section::Msg) {
+                auto id = static_cast<MessageId>(std::stoull(line));
+                if (recentIncomingMessageIds_.insert(id).second) recentIncomingMessageOrder_.push_back(id);
+            } else if (sec == Section::Ctrl) {
+                if (recentControlReplayKeys_.insert(line).second) recentControlReplayOrder_.push_back(line);
+            }
+        } catch (...) {}
+    }
+    while (recentIncomingMessageOrder_.size() > maxRecentIncomingMessageIds_) {
+        auto old = recentIncomingMessageOrder_.front();
+        recentIncomingMessageOrder_.pop_front();
+        recentIncomingMessageIds_.erase(old);
+    }
+    while (recentControlReplayOrder_.size() > maxRecentControlReplayKeys_) {
+        auto old = recentControlReplayOrder_.front();
+        recentControlReplayOrder_.pop_front();
+        recentControlReplayKeys_.erase(old);
+    }
+}
+
 bool P2PNode::SaveMessageJournalToDisk() const {
     try {
         fs::path path = fs::path(messageJournalRootDir_) / (local_.nodeId + ".journal");
@@ -2149,6 +2945,7 @@ void P2PNode::HandleHistorySyncResponse(const std::shared_ptr<PeerConnection>& p
     HistorySyncResponsePayload resp{};
     if (!protocol::DeserializeHistorySyncResponse(payload, resp)) return;
     if (resp.targetNodeId != local_.nodeId) return;
+    if (IsBlockedNode(resp.responderNodeId)) return;
 
     ByteVector pub;
     {
@@ -2702,6 +3499,7 @@ void P2PNode::PrintSessions() const {
 }
 
 void P2PNode::PrintInfo() const {
+    utils::LogRaw("PeerLink version: " + std::string(kAppVersion) + " protocol=" + std::to_string(kProtocolVersion));
     utils::LogRaw("========================================");
     utils::LogRaw("You: " + local_.nickname);
     utils::LogRaw("ID:  " + local_.nodeId);
@@ -2738,6 +3536,89 @@ void P2PNode::PrintInfo() const {
         utils::LogRaw("Queued relay ACKs: " + std::to_string(totalQueuedAcks));
     }
     utils::LogRaw("========================================");
+}
+
+void P2PNode::PrintNatStatus() const {
+    std::optional<nat::StunBindingResult> stun;
+    std::optional<nat::TurnAllocationResult> turn;
+    std::size_t pendingNat = 0;
+    {
+        std::lock_guard<std::mutex> lock(natMutex_);
+        if (natClient_) {
+            stun = natClient_->GetLastBinding();
+            turn = natClient_->GetTurnAllocation();
+            pendingNat = natClient_->PendingTransactions();
+        }
+    }
+    std::string observedIp; std::uint16_t observedPort = 0; std::string udpIp; std::uint16_t udpPort = 0; std::string relayIp; std::uint16_t relayPort = 0;
+    {
+        std::lock_guard<std::mutex> lock(observedEndpointMutex_);
+        observedIp = localObservedIp_; observedPort = localObservedPort_;
+        udpIp = localObservedUdpIp_; udpPort = localObservedUdpPort_;
+        relayIp = relayedIp_; relayPort = relayedPort_;
+    }
+    utils::LogRaw("=== NAT Traversal ===");
+    utils::LogRaw("STUN servers: " + std::to_string(stunServers_.size()));
+    utils::LogRaw("TURN servers: " + std::to_string(turnServers_.size()));
+    utils::LogRaw("Pending NAT transactions: " + std::to_string(pendingNat));
+    utils::LogRaw("Observed TCP endpoint: " + (observedIp.empty() ? std::string("unknown") : observedIp + ":" + std::to_string(observedPort)));
+    utils::LogRaw("Observed UDP endpoint: " + (udpIp.empty() ? std::string("unknown") : udpIp + ":" + std::to_string(udpPort)));
+    if (stun) utils::LogRaw("Last STUN binding: " + stun->mappedIp + ":" + std::to_string(stun->mappedPort) + " via " + stun->serverIp + ":" + std::to_string(stun->serverPort));
+    else utils::LogRaw("Last STUN binding: none");
+    if (turn && turn->allocated) utils::LogRaw("TURN relay allocation: " + turn->relayedIp + ":" + std::to_string(turn->relayedPort) + " mapped=" + turn->mappedIp + ":" + std::to_string(turn->mappedPort));
+    else utils::LogRaw("TURN relay allocation: none");
+    if (!relayIp.empty() && relayPort != 0) utils::LogRaw("Active relay candidate: " + relayIp + ":" + std::to_string(relayPort));
+}
+
+void P2PNode::PrintStats() const {
+    utils::LogRaw("=== Runtime Stats ===");
+    std::size_t activePeers = peerManager_.GetAllPeers().size();
+    std::size_t pendingHandshakes = 0;
+    { std::lock_guard<std::mutex> lock(pendingMutex_); pendingHandshakes = pendingPeers_.size(); }
+    std::size_t relayMsgs = 0, relayAcks = 0;
+    {
+        std::lock_guard<std::mutex> lock(relayMutex_);
+        for (const auto& [_, q] : relayQueuesByTarget_) relayMsgs += q.size();
+        for (const auto& [_, q] : relayAckQueuesByTarget_) relayAcks += q.size();
+    }
+    std::size_t activeTransfers = 0;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (const auto& [_, st] : fileTransferStatuses_) {
+            if (st.state != FileTransferState::Completed && st.state != FileTransferState::Rejected && st.state != FileTransferState::Failed) ++activeTransfers;
+        }
+    }
+    RuntimeMetrics metricsCopy{};
+    { std::lock_guard<std::mutex> m(metricsMutex_); metricsCopy = metrics_; }
+    utils::LogRaw("Active peers: " + std::to_string(activePeers));
+    utils::LogRaw("Pending handshakes: " + std::to_string(pendingHandshakes));
+    utils::LogRaw("Relay queued messages: " + std::to_string(relayMsgs));
+    utils::LogRaw("Relay queued ACKs: " + std::to_string(relayAcks));
+    utils::LogRaw("Active transfers: " + std::to_string(activeTransfers));
+    utils::LogRaw("Rate-limit hits: " + std::to_string(metricsCopy.rateLimitHits));
+    utils::LogRaw("Handshake rejects: " + std::to_string(metricsCopy.handshakeRejects));
+    utils::LogRaw("Handshake flood rejects: " + std::to_string(metricsCopy.handshakeFloodRejects));
+    utils::LogRaw("Handshake cooldown blocks: " + std::to_string(metricsCopy.handshakeCooldownBlocks));
+    utils::LogRaw("Replay drops: " + std::to_string(metricsCopy.replayDrops));
+    utils::LogRaw("Relay queue drops: " + std::to_string(metricsCopy.relayQueueDrops));
+    utils::LogRaw("File transfer cancels: " + std::to_string(metricsCopy.fileTransferCancels));
+    utils::LogRaw("File transfer completions: " + std::to_string(metricsCopy.fileTransferCompletions));
+    utils::LogRaw("File transfer retries: " + std::to_string(metricsCopy.fileTransferRetries));
+    utils::LogRaw("File transfer failures: " + std::to_string(metricsCopy.fileTransferFailures));
+    utils::LogRaw("History searches: " + std::to_string(metricsCopy.historySearches));
+    utils::LogRaw("History exports: " + std::to_string(metricsCopy.historyExports));
+    utils::LogRaw("STUN queries: " + std::to_string(metricsCopy.stunQueries));
+    utils::LogRaw("STUN successes: " + std::to_string(metricsCopy.stunSuccesses));
+    utils::LogRaw("TURN allocations: " + std::to_string(metricsCopy.turnAllocations));
+    utils::LogRaw("TURN refreshes: " + std::to_string(metricsCopy.turnRefreshes));
+    utils::LogRaw("Relay queue pressure events: " + std::to_string(metricsCopy.relayQueuePressureEvents));
+    utils::LogRaw("Relay retry budget drops: " + std::to_string(metricsCopy.relayRetryBudgetDrops));
+    utils::LogRaw("Crash recovery restarts: " + std::to_string(metricsCopy.crashRecoveryRestarts));
+    utils::LogRaw("Crash recovery transfer resumes: " + std::to_string(metricsCopy.crashRecoveryTransferResumes));
+    std::size_t recentMsg = 0, recentCtrl = 0;
+    { std::lock_guard<std::mutex> lock(replayMutex_); recentMsg = recentIncomingMessageOrder_.size(); recentCtrl = recentControlReplayOrder_.size(); }
+    utils::LogRaw("Replay cache messages: " + std::to_string(recentMsg));
+    utils::LogRaw("Replay cache control keys: " + std::to_string(recentCtrl));
 }
 
 bool P2PNode::SaveOverlayState() const {
@@ -3001,54 +3882,48 @@ bool P2PNode::SendGroupMessageByIndex(int groupIndex, const std::string& text) {
 }
 
 bool P2PNode::SendFileOfferToPeer(const NodeId& targetNodeId, const std::string& displayName, const std::filesystem::path& srcPath, const std::string& groupId, const std::string& groupName) {
-    auto contactOpt = FindContact(targetNodeId);
-    if (!contactOpt || !contactOpt->trusted || contactOpt->blocked) {
-        utils::LogError("File send requires trusted non-blocked contact");
-        return false;
-    }
-    auto sessionIdOpt = FindSessionByPeer(targetNodeId);
-    ByteVector sessionKey;
-    if (!sessionIdOpt || !GetSessionKeyForPeer(targetNodeId, sessionKey)) {
-        utils::LogError("No E2E session key for this private chat yet");
-        return false;
-    }
+    namespace fs = std::filesystem;
     std::error_code ec;
-    if (!fs::exists(srcPath, ec) || !fs::is_regular_file(srcPath, ec)) {
-        utils::LogError("Attachment source file not found");
+    if (!fs::exists(srcPath, ec) || fs::is_directory(srcPath, ec)) {
+        utils::LogError("Attachment path is not a file: " + srcPath.string());
         return false;
     }
-    const auto size = static_cast<std::uint64_t>(fs::file_size(srcPath, ec));
-    if (ec) {
-        utils::LogError("Failed to read attachment size");
+
+    std::uint64_t size = 0;
+    std::string checksum;
+    if (!ComputeFileFnv64(srcPath, size, checksum)) {
+        utils::LogError("Failed to inspect attachment source file");
         return false;
     }
     if (size == 0) {
-        utils::LogError("Empty files are not supported");
+        utils::LogError("Refusing to send empty file");
         return false;
     }
-    if (size > kInlineFileTransferLimit) {
-        utils::LogError("File is too large for current alpha transfer layer (limit 256 KB)");
+    if (size > kMaxFileTransferBytes) {
+        utils::LogError("File exceeds max supported size of 10 GiB");
         return false;
     }
-    std::ifstream in(srcPath, std::ios::binary);
-    if (!in) {
-        utils::LogError("Failed to open attachment source file");
-        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        if (outgoingFileTransfers_.size() >= maxOutgoingFileTransfers_) {
+            utils::LogError("Too many active outgoing file transfers");
+            return false;
+        }
     }
-    ByteVector bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (bytes.size() != size) {
-        utils::LogError("Failed to read full attachment payload");
-        return false;
-    }
+
     OutgoingFileTransfer transfer{};
-    transfer.transferId = utils::GenerateNodeId();
+    transfer.transferId = local_.nodeId + "-" + std::to_string(utils::GeneratePacketId());
     transfer.targetNodeId = targetNodeId;
     transfer.targetNickname = displayName;
-    transfer.fileName = srcPath.filename().string();
+    transfer.fileName = SanitizeFileName(srcPath.filename().string());
     transfer.fileSize = size;
     transfer.groupId = groupId;
     transfer.groupName = groupName;
-    transfer.bytes = std::move(bytes);
+    transfer.sourcePath = srcPath.string();
+    transfer.totalChunks = static_cast<std::size_t>((size + kFileChunkBytes - 1) / kFileChunkBytes);
+    transfer.fileChecksum = checksum;
+
     {
         std::lock_guard<std::mutex> lock(fileTransfersMutex_);
         outgoingFileTransfers_[transfer.transferId] = transfer;
@@ -3060,25 +3935,30 @@ bool P2PNode::SendFileOfferToPeer(const NodeId& targetNodeId, const std::string&
         st.fileSize = transfer.fileSize;
         st.state = FileTransferState::Offered;
         st.incoming = false;
+        st.resumable = true;
+        st.totalChunks = transfer.totalChunks;
+        st.currentChunk = 0;
+        st.sourcePath = transfer.sourcePath;
         st.groupName = groupName;
+        st.fileChecksum = checksum;
         st.updatedAtUnix = NowUnix();
         st.deadlineUnix = st.updatedAtUnix + transferTimeoutSeconds_;
-        st.resumable = true;
         fileTransferStatuses_[st.transferId] = st;
     }
-    SendPrivateMessage(targetNodeId,
-        "[[FILEOFFER]]|" + transfer.transferId + "|" + transfer.fileName + "|" + std::to_string(transfer.fileSize) + "|" + transfer.groupId + "|" + transfer.groupName);
-    if (groupId.empty()) {
-        utils::LogSystem("File offer sent to " + displayName + ": " + transfer.fileName + " (use /downloads on receiver)");
-    } else {
-        utils::LogSystem("Group file offer sent to " + displayName + " for group " + groupName + ": " + transfer.fileName);
-    }
+
+    const std::string offerText = "[[FILEOFFER]]|" + transfer.transferId + "|" + transfer.fileName + "|" + std::to_string(transfer.fileSize) +
+        "|" + transfer.groupId + "|" + transfer.groupName + "|" + std::to_string(transfer.totalChunks) + "|" + transfer.fileChecksum + "|v2";
+    SendPrivateMessage(targetNodeId, offerText);
+    utils::LogSystem("File offer sent to " + displayName + ": " + transfer.fileName + " chunks=" + std::to_string(transfer.totalChunks));
     return true;
 }
 
 bool P2PNode::SendAttachmentByContactIndex(int contactIndex, const std::string& pathText) {
     auto contacts = GetSortedContacts();
-    if (contactIndex <= 0 || static_cast<std::size_t>(contactIndex) > contacts.size()) return false;
+    if (contactIndex <= 0 || static_cast<std::size_t>(contactIndex) > contacts.size()) {
+        utils::LogError("Invalid contact index for /sendfile");
+        return false;
+    }
     const auto& contact = contacts[static_cast<std::size_t>(contactIndex - 1)];
     return SendFileOfferToPeer(contact.nodeId, contact.nickname.empty() ? contact.nodeId : contact.nickname, fs::path(pathText));
 }
@@ -3120,6 +4000,120 @@ void P2PNode::PrintPendingFiles() const {
     }
 }
 
+bool P2PNode::SendFileChunksStream(const std::string& transferId, std::size_t startChunk) {
+    struct StreamGuard {
+        P2PNode* self = nullptr;
+        std::string id;
+        ~StreamGuard() {
+            if (!self || id.empty()) return;
+            std::lock_guard<std::mutex> lock(self->fileTransfersMutex_);
+            auto it = self->outgoingFileTransfers_.find(id);
+            if (it != self->outgoingFileTransfers_.end()) {
+                it->second.streamInProgress = false;
+            }
+        }
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        if (outgoingFileTransfers_.size() >= maxOutgoingFileTransfers_) {
+            utils::LogError("Too many active outgoing file transfers");
+            return false;
+        }
+    }
+
+    OutgoingFileTransfer transfer{};
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        auto it = outgoingFileTransfers_.find(transferId);
+        if (it == outgoingFileTransfers_.end()) return false;
+        transfer = it->second;
+    }
+    StreamGuard streamGuard{this, transferId};
+    if (IsBlockedNode(transfer.targetNodeId)) { utils::LogError("Refusing to send file to blocked contact"); return false; }
+    namespace fs = std::filesystem;
+    std::ifstream in(transfer.sourcePath, std::ios::binary);
+    if (!in) {
+        utils::LogError("Failed to open transfer source file: " + transfer.sourcePath);
+        return false;
+    }
+    const std::uint64_t startOffset = static_cast<std::uint64_t>(startChunk) * static_cast<std::uint64_t>(kFileChunkBytes);
+    in.seekg(static_cast<std::streamoff>(startOffset), std::ios::beg);
+    if (!in.good()) {
+        utils::LogError("Failed to seek transfer source file");
+        return false;
+    }
+
+    constexpr std::size_t kMaxQueuedPackets = 32;
+    constexpr auto kQueueBackpressureSleep = std::chrono::milliseconds(1);
+    constexpr auto kChunkPacingSleep = std::chrono::milliseconds(2);
+    constexpr auto kRelayFallbackChunkPacingSleep = std::chrono::milliseconds(10);
+
+    bool relayFallbackActive = false;
+    ByteVector chunk(kFileChunkBytes);
+    for (std::size_t idx = startChunk; idx < transfer.totalChunks; ++idx) {
+        auto directPeer = peerManager_.FindByNodeId(transfer.targetNodeId);
+        const bool canUseDirect = directPeer && directPeer->IsAlive();
+        if (canUseDirect) {
+            while (directPeer->GetQueuedPacketCount() >= kMaxQueuedPackets) {
+                std::this_thread::sleep_for(kQueueBackpressureSleep);
+                directPeer = peerManager_.FindByNodeId(transfer.targetNodeId);
+                if (!directPeer || !directPeer->IsAlive()) {
+                    relayFallbackActive = true;
+                    break;
+                }
+            }
+        } else {
+            if (!relayFallbackActive) {
+                relayFallbackActive = true;
+                utils::LogSystem("Using relay fallback for file transfer: " + transfer.fileName + " to " + (transfer.targetNickname.empty() ? transfer.targetNodeId : transfer.targetNickname));
+            }
+        }
+
+        in.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+        const auto got = in.gcount();
+        if (got <= 0) break;
+        chunk.resize(static_cast<std::size_t>(got));
+        const auto offsetBytes = static_cast<std::uint64_t>(idx) * static_cast<std::uint64_t>(kFileChunkBytes);
+        const auto chunkChecksum = Fnv1aHex(Fnv1aUpdate(Fnv1aInit(), chunk));
+        SendPrivateMessage(transfer.targetNodeId, "[[FILECHUNK]]|" + transfer.transferId + "|" + std::to_string(idx + 1) + "|" + std::to_string(transfer.totalChunks) +
+            "|" + transfer.fileName + "|" + std::to_string(offsetBytes) + "|" + BytesToHexLocal(chunk) + "|" + chunkChecksum);
+        {
+            std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+            auto out = outgoingFileTransfers_.find(transfer.transferId);
+            if (out != outgoingFileTransfers_.end()) {
+                out->second.nextChunkIndex = idx + 1;
+            }
+            auto st = fileTransferStatuses_.find(transfer.transferId);
+            if (st != fileTransferStatuses_.end()) {
+                st->second.state = FileTransferState::Transferring;
+                st->second.currentChunk = idx + 1;
+                st->second.totalChunks = transfer.totalChunks;
+                st->second.bytesTransferred = std::min<std::uint64_t>(transfer.fileSize, offsetBytes + static_cast<std::uint64_t>(got));
+                st->second.updatedAtUnix = NowUnix();
+                st->second.deadlineUnix = NowUnix() + transferTimeoutSeconds_;
+            }
+        }
+        std::this_thread::sleep_for(relayFallbackActive ? kRelayFallbackChunkPacingSleep : kChunkPacingSleep);
+        chunk.resize(kFileChunkBytes);
+    }
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        outgoingFileTransfers_.erase(transfer.transferId);
+        auto st = fileTransferStatuses_.find(transfer.transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Completed;
+            st->second.currentChunk = transfer.totalChunks;
+            st->second.totalChunks = transfer.totalChunks;
+            st->second.bytesTransferred = transfer.fileSize;
+            st->second.updatedAtUnix = NowUnix();
+            st->second.deadlineUnix = 0;
+        }
+    }
+    utils::LogSystem("File data sent: " + transfer.fileName + " to " + (transfer.targetNickname.empty() ? transfer.targetNodeId : transfer.targetNickname) + (relayFallbackActive ? " via relay fallback" : ""));
+    return true;
+}
+
 bool P2PNode::RetryFileTransfer(const std::string& transferId) {
     OutgoingFileTransfer outgoing{};
     IncomingFileOffer incoming{};
@@ -3133,10 +4127,10 @@ bool P2PNode::RetryFileTransfer(const std::string& transferId) {
         if (in != pendingIncomingFileOffers_.end()) { incoming = in->second; haveIncoming = true; }
     }
     if (haveOutgoing) {
-        SendPrivateMessage(outgoing.targetNodeId, "[[FILEOFFER]]|" + outgoing.transferId + "|" + outgoing.fileName + "|" + std::to_string(outgoing.fileSize) + "|" + outgoing.groupId + "|" + outgoing.groupName); return true;
+        SendPrivateMessage(outgoing.targetNodeId, "[[FILEOFFER]]|" + outgoing.transferId + "|" + outgoing.fileName + "|" + std::to_string(outgoing.fileSize) + "|" + outgoing.groupId + "|" + outgoing.groupName + "|" + std::to_string(outgoing.totalChunks) + "|" + outgoing.fileChecksum + "|v2"); return true;
     }
     if (haveIncoming && incoming.accepted) {
-        SendPrivateMessage(incoming.senderNodeId, "[[FILEACCEPT]]|" + incoming.transferId); return true;
+        SendPrivateMessage(incoming.senderNodeId, "[[FILEACCEPT]]|" + incoming.transferId + "|1"); return true;
     }
     return false;
 }
@@ -3153,6 +4147,7 @@ void P2PNode::TickFileTransfers() {
                 st.state = FileTransferState::Failed;
                 st.updatedAtUnix = NowUnix();
                 st.deadlineUnix = 0;
+                { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferFailures; }
                 utils::LogError("File transfer failed by timeout: " + st.transferId);
                 continue;
             }
@@ -3163,7 +4158,20 @@ void P2PNode::TickFileTransfers() {
         }
     }
     for (const auto& id : timedOut) {
-        if (RetryFileTransfer(id)) utils::LogSystem("Retried file transfer: " + id);
+        if (RetryFileTransfer(id)) {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferRetries; }
+            utils::LogSystem("Retried file transfer: " + id);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (auto it = incomingFileTransfers_.begin(); it != incomingFileTransfers_.end();) {
+            auto stIt = fileTransferStatuses_.find(it->first);
+            const bool stale = (stIt == fileTransferStatuses_.end()) || (stIt->second.state == FileTransferState::Failed) || (stIt->second.state == FileTransferState::Rejected);
+            if (!stale) { ++it; continue; }
+            std::error_code ec; if (!it->second.tempPath.empty()) fs::remove(it->second.tempPath, ec);
+            it = incomingFileTransfers_.erase(it);
+        }
     }
 }
 
@@ -3187,6 +4195,13 @@ void P2PNode::PrintFileTransfers() const {
             " state=" + ToString(st.state);
         if (st.totalChunks > 0) {
             line += " chunks=" + std::to_string(st.currentChunk) + "/" + std::to_string(st.totalChunks);
+        }
+        if (st.bytesTransferred > 0) {
+            line += " bytes=" + std::to_string(st.bytesTransferred);
+            if (st.fileSize > 0) {
+                const auto pct = static_cast<std::uint64_t>((st.bytesTransferred * 100ull) / st.fileSize);
+                line += " (" + std::to_string(pct) + "%)";
+            }
         }
         if (!st.groupName.empty()) line += " group=" + st.groupName;
         utils::LogRaw(line);
@@ -3229,6 +4244,12 @@ bool P2PNode::AcceptPendingFileByIndex(int index) {
     }
     {
         std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        std::size_t activeIncoming = 0;
+        for (const auto& [_, st] : fileTransferStatuses_) if (st.incoming && (st.state == FileTransferState::Accepted || st.state == FileTransferState::Transferring)) ++activeIncoming;
+        if (activeIncoming >= maxParallelIncomingTransfers_) {
+            utils::LogError("Too many active incoming transfers");
+            return false;
+        }
         auto it = pendingIncomingFileOffers_.find(picked.transferId);
         if (it == pendingIncomingFileOffers_.end()) return false;
         it->second.accepted = true;
@@ -3240,7 +4261,7 @@ bool P2PNode::AcceptPendingFileByIndex(int index) {
             st->second.peerAccepted = true;
         }
     }
-    SendPrivateMessage(picked.senderNodeId, "[[FILEACCEPT]]|" + picked.transferId);
+    SendPrivateMessage(picked.senderNodeId, "[[FILEACCEPT]]|" + picked.transferId + "|1");
     utils::LogSystem("Accepted file download: " + picked.fileName);
     return true;
 }
@@ -3272,6 +4293,79 @@ bool P2PNode::RejectPendingFileByIndex(int index) {
     }
     SendPrivateMessage(picked.senderNodeId, "[[FILEREJECT]]|" + picked.transferId);
     utils::LogSystem("Rejected file: " + picked.fileName);
+    return true;
+}
+
+bool P2PNode::CancelFileTransferByIndex(int index) {
+    if (index <= 0) return false;
+    std::vector<FileTransferStatus> items;
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        for (const auto& [_, st] : fileTransferStatuses_) items.push_back(st);
+    }
+    std::sort(items.begin(), items.end(), [](const FileTransferStatus& a, const FileTransferStatus& b) {
+        if (a.updatedAtUnix != b.updatedAtUnix) return a.updatedAtUnix > b.updatedAtUnix;
+        return a.transferId < b.transferId;
+    });
+    if (static_cast<std::size_t>(index) > items.size()) return false;
+    const auto picked = items[static_cast<std::size_t>(index - 1)];
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        outgoingFileTransfers_.erase(picked.transferId);
+        pendingIncomingFileOffers_.erase(picked.transferId);
+        auto itIn = incomingFileTransfers_.find(picked.transferId);
+        if (itIn != incomingFileTransfers_.end()) {
+            std::error_code ec; if (!itIn->second.tempPath.empty()) fs::remove(itIn->second.tempPath, ec);
+            incomingFileTransfers_.erase(itIn);
+        }
+        auto st = fileTransferStatuses_.find(picked.transferId);
+        if (st != fileTransferStatuses_.end()) {
+            st->second.state = FileTransferState::Failed;
+            st->second.updatedAtUnix = NowUnix();
+            st->second.deadlineUnix = 0;
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferFailures; }
+        }
+    }
+    { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferCancels; }
+    utils::LogSystem("Cancelled file transfer: " + picked.transferId);
+    return true;
+}
+
+bool P2PNode::SearchConversationHistoryByContactIndex(int index, const std::string& term) const {
+    if (index <= 0 || term.empty()) return false;
+    auto contacts = GetSortedContacts();
+    if (static_cast<std::size_t>(index) > contacts.size()) return false;
+    const auto& c = contacts[static_cast<std::size_t>(index - 1)];
+    std::vector<StoredConversationMessage> messages;
+    std::string error;
+    if (!ConversationStore::LoadConversation(historyRootDir_, local_.nodeId, c.nodeId, const_cast<CryptoSigner&>(signer_), messages, &error)) return false;
+    utils::LogRaw("=== Search history with " + ResolveDisplayName(c.nodeId, c.nickname) + " for: " + term + " ===");
+    std::size_t hits = 0;
+    for (const auto& msg : messages) {
+        if (msg.text.find(term) == std::string::npos) continue;
+        ++hits;
+        utils::LogRaw(std::to_string(msg.messageId) + " | " + (msg.direction == StoredMessageDirection::Outgoing ? "you" : ResolveDisplayName(c.nodeId, c.nickname)) + ": " + msg.text);
+    }
+    if (hits == 0) utils::LogRaw("  (no matches)");
+    { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.historySearches; }
+    utils::LogRaw("Matches: " + std::to_string(hits));
+    return true;
+}
+
+bool P2PNode::ExportConversationHistoryByContactIndex(int index, const std::string& path) const {
+    if (index <= 0 || path.empty()) return false;
+    auto contacts = GetSortedContacts();
+    if (static_cast<std::size_t>(index) > contacts.size()) return false;
+    const auto& c = contacts[static_cast<std::size_t>(index - 1)];
+    std::vector<StoredConversationMessage> messages;
+    std::string error;
+    if (!ConversationStore::LoadConversation(historyRootDir_, local_.nodeId, c.nodeId, const_cast<CryptoSigner&>(signer_), messages, &error)) return false;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    for (const auto& msg : messages) {
+        out << msg.messageId << '	' << (msg.direction == StoredMessageDirection::Outgoing ? "out" : "in") << '	' << static_cast<int>(msg.state) << '	' << msg.text << "\n";
+    }
+    utils::LogSystem("Exported chat history to " + path);
     return true;
 }
 
@@ -3321,24 +4415,34 @@ bool P2PNode::SyncDeviceByIndex(int index) {
 
 bool P2PNode::ApplyDeviceSyncText(const NodeId& senderNodeId, const std::string& text) {
     auto parts = SplitPipe(text);
+    if (IsBlockedNode(senderNodeId)) return false;
     if (parts.size() < 4 || parts[0] != "[[DEVSYNC]]") return false;
     utils::LogSystem("Synced from device " + senderNodeId + " peer=" + parts[1] + " msg=" + parts[3]);
     return true;
 }
 
 bool P2PNode::ApplyFileOfferText(const NodeId& senderNodeId, const std::string& senderNickname, const std::string& text) {
+    if (IsBlockedNode(senderNodeId)) { utils::LogWarn("Ignoring file offer from blocked contact: " + senderNodeId); return false; }
     auto parts = SplitPipe(text);
     if (parts.size() < 4 || parts[0] != "[[FILEOFFER]]") return false;
     IncomingFileOffer offer{};
     offer.transferId = parts[1];
     offer.senderNodeId = senderNodeId;
     offer.senderNickname = senderNickname;
-    offer.fileName = parts[2];
+    offer.fileName = SanitizeFileName(parts[2]);
     try { offer.fileSize = static_cast<std::uint64_t>(std::stoull(parts[3])); } catch (...) { return false; }
+    if (offer.fileSize == 0 || offer.fileSize > kMaxFileTransferBytes) return false;
     if (parts.size() > 4) offer.groupId = parts[4];
     if (parts.size() > 5) offer.groupName = parts[5];
+    if (parts.size() > 6) { try { offer.totalChunks = static_cast<std::size_t>(std::stoull(parts[6])); } catch (...) { offer.totalChunks = 0; } }
+    if (parts.size() > 7) offer.fileChecksum = parts[7];
+    if (offer.totalChunks == 0) offer.totalChunks = static_cast<std::size_t>((offer.fileSize + kFileChunkBytes - 1) / kFileChunkBytes);
     {
         std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        if (pendingIncomingFileOffers_.size() >= maxPendingIncomingFileOffers_) {
+            utils::LogWarn("Dropping incoming file offer due to anti-abuse limit");
+            return false;
+        }
         pendingIncomingFileOffers_[offer.transferId] = offer;
         incomingFileTransfers_.erase(offer.transferId);
         FileTransferStatus st{};
@@ -3350,13 +4454,15 @@ bool P2PNode::ApplyFileOfferText(const NodeId& senderNodeId, const std::string& 
         st.state = FileTransferState::Offered;
         st.incoming = true;
         st.groupName = offer.groupName;
+        st.totalChunks = offer.totalChunks;
+        st.fileChecksum = offer.fileChecksum;
         st.updatedAtUnix = NowUnix();
         st.deadlineUnix = st.updatedAtUnix + transferTimeoutSeconds_;
         st.resumable = true;
         fileTransferStatuses_[st.transferId] = st;
     }
     std::string msg = "Incoming file offer from " + (senderNickname.empty() ? senderNodeId : senderNickname) + ": " + offer.fileName +
-                      " (" + std::to_string(offer.fileSize) + " bytes)";
+                      " (" + std::to_string(offer.fileSize) + " bytes, chunks=" + std::to_string(offer.totalChunks) + ")";
     if (!offer.groupName.empty()) msg += " in group " + offer.groupName;
     msg += ". Use /downloads and /download <n> or /rejectfile <n>.";
     utils::LogSystem(msg);
@@ -3366,40 +4472,51 @@ bool P2PNode::ApplyFileOfferText(const NodeId& senderNodeId, const std::string& 
 bool P2PNode::ApplyFileAcceptText(const NodeId& senderNodeId, const std::string& text) {
     auto parts = SplitPipe(text);
     if (parts.size() < 2 || parts[0] != "[[FILEACCEPT]]") return false;
+    std::size_t startChunk = 1;
+    if (parts.size() > 2) { try { startChunk = static_cast<std::size_t>(std::stoull(parts[2])); } catch (...) { startChunk = 1; } }
+
+    {
+        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+        if (outgoingFileTransfers_.size() >= maxOutgoingFileTransfers_) {
+            utils::LogError("Too many active outgoing file transfers");
+            return false;
+        }
+    }
+
     OutgoingFileTransfer transfer{};
+    bool shouldLaunchStream = false;
     {
         std::lock_guard<std::mutex> lock(fileTransfersMutex_);
         auto it = outgoingFileTransfers_.find(parts[1]);
         if (it == outgoingFileTransfers_.end()) return true;
+        if (it->second.targetNodeId != senderNodeId) return true;
+
+        it->second.nextChunkIndex = startChunk > 0 ? startChunk - 1 : 0;
         transfer = it->second;
-    }
-    if (transfer.targetNodeId != senderNodeId) return true;
-    const std::size_t totalChunks = (transfer.bytes.size() + kFileChunkBytes - 1) / kFileChunkBytes;
-    {
-        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
+
+        if (!it->second.streamInProgress) {
+            it->second.streamInProgress = true;
+            shouldLaunchStream = true;
+        }
+
         auto st = fileTransferStatuses_.find(transfer.transferId);
         if (st != fileTransferStatuses_.end()) {
             st->second.state = FileTransferState::Transferring;
-            st->second.totalChunks = totalChunks;
-            st->second.currentChunk = 0;
+            st->second.totalChunks = transfer.totalChunks;
+            st->second.currentChunk = transfer.nextChunkIndex;
+            st->second.peerAccepted = true;
             st->second.updatedAtUnix = NowUnix();
+            st->second.deadlineUnix = st->second.updatedAtUnix + transferTimeoutSeconds_;
         }
     }
-    for (std::size_t i = 0; i < totalChunks; ++i) {
-        const std::size_t off = i * kFileChunkBytes;
-        const std::size_t len = std::min(kFileChunkBytes, transfer.bytes.size() - off);
-        ByteVector chunk(transfer.bytes.begin() + static_cast<std::ptrdiff_t>(off), transfer.bytes.begin() + static_cast<std::ptrdiff_t>(off + len));
-        SendPrivateMessage(senderNodeId, "[[FILECHUNK]]|" + transfer.transferId + "|" + std::to_string(i + 1) + "|" + std::to_string(totalChunks) +
-            "|" + transfer.fileName + "|" + BytesToHexLocal(chunk));
-        std::lock_guard<std::mutex> lock(fileTransfersMutex_);
-        auto st = fileTransferStatuses_.find(transfer.transferId);
-        if (st != fileTransferStatuses_.end()) {
-            st->second.currentChunk = i + 1;
-            st->second.updatedAtUnix = NowUnix();
-        }
+
+    if (!shouldLaunchStream) {
+        return true;
     }
-    { std::lock_guard<std::mutex> lock(fileTransfersMutex_); outgoingFileTransfers_.erase(transfer.transferId); auto st=fileTransferStatuses_.find(transfer.transferId); if (st!=fileTransferStatuses_.end()) { st->second.state = FileTransferState::Completed; st->second.updatedAtUnix = NowUnix(); } }
-    utils::LogSystem("File data sent: " + transfer.fileName + " to " + (transfer.targetNickname.empty() ? senderNodeId : transfer.targetNickname));
+
+    std::thread([this, transferId = transfer.transferId, startAt = transfer.nextChunkIndex]() {
+        SendFileChunksStream(transferId, startAt);
+    }).detach();
     return true;
 }
 
@@ -3426,18 +4543,27 @@ bool P2PNode::ApplyFileRejectText(const NodeId& senderNodeId, const std::string&
 
 bool P2PNode::ApplyFileChunkText(const NodeId& senderNodeId, const std::string& text) {
     auto parts = SplitPipe(text);
-    if (parts.size() < 6 || parts[0] != "[[FILECHUNK]]") return false;
+    if (parts.size() < 8 || parts[0] != "[[FILECHUNK]]") return false;
     const auto transferId = parts[1];
     std::size_t seq = 0, total = 0;
+    std::uint64_t offsetBytes = 0;
     try {
         seq = static_cast<std::size_t>(std::stoull(parts[2]));
         total = static_cast<std::size_t>(std::stoull(parts[3]));
+        offsetBytes = static_cast<std::uint64_t>(std::stoull(parts[5]));
     } catch (...) { return false; }
     if (seq == 0 || total == 0 || seq > total) return false;
     ByteVector chunk;
-    if (!HexToBytesLocal(parts[5], chunk)) return false;
+    if (!HexToBytesLocal(parts[6], chunk)) return false;
+    const std::string chunkChecksum = parts[7];
+    if (Fnv1aHex(Fnv1aUpdate(Fnv1aInit(), chunk)) != chunkChecksum) {
+        utils::LogError("Rejected corrupted file chunk for transfer " + transferId);
+        return true;
+    }
 
     IncomingFileOffer offer;
+    fs::path finalPath;
+    bool completed = false;
     {
         std::lock_guard<std::mutex> lock(fileTransfersMutex_);
         auto itOffer = pendingIncomingFileOffers_.find(transferId);
@@ -3445,61 +4571,86 @@ bool P2PNode::ApplyFileChunkText(const NodeId& senderNodeId, const std::string& 
         offer = itOffer->second;
         auto& transfer = incomingFileTransfers_[transferId];
         if (transfer.offer.transferId.empty()) transfer.offer = offer;
-        if (transfer.totalChunks == 0) {
-            transfer.totalChunks = total;
-            transfer.chunks.resize(total);
-            transfer.received.assign(total, false);
-            transfer.receivedCount = 0;
-            auto st = fileTransferStatuses_.find(transferId);
-            if (st != fileTransferStatuses_.end()) {
-                st->second.state = FileTransferState::Transferring;
-                st->second.totalChunks = total;
-                st->second.currentChunk = 0;
-                st->second.updatedAtUnix = NowUnix();
+        if (transfer.totalChunks == 0) transfer.totalChunks = total;
+        if (transfer.nextExpectedChunk == 0) transfer.nextExpectedChunk = 1;
+        if (transfer.tempPath.empty()) {
+            fs::path dir = fs::path("downloads") / local_.nodeId / (offer.groupName.empty() ? senderNodeId : offer.groupName);
+            std::error_code ec; fs::create_directories(dir, ec);
+            finalPath = dir / offer.fileName;
+            if (fs::exists(finalPath)) {
+                for (int n = 1; n < 1000; ++n) {
+                    fs::path cand = dir / (finalPath.stem().string() + "_" + std::to_string(n) + finalPath.extension().string());
+                    if (!fs::exists(cand)) { finalPath = cand; break; }
+                }
             }
+            transfer.tempPath = (finalPath.string() + ".part");
+            std::ofstream create(transfer.tempPath, std::ios::binary | std::ios::trunc);
+            create.close();
+            transfer.rollingChecksum = Fnv1aHex(Fnv1aInit());
+        } else {
+            finalPath = fs::path(transfer.tempPath);
+            finalPath.replace_extension("");
         }
-        if (transfer.totalChunks != total) return true;
-        const std::size_t idx = seq - 1;
-        if (!transfer.received[idx]) {
-            transfer.chunks[idx] = std::move(chunk);
-            transfer.received[idx] = true;
-            transfer.receivedCount += 1;
-            auto st = fileTransferStatuses_.find(transferId);
-            if (st != fileTransferStatuses_.end()) {
-                st->second.currentChunk = transfer.receivedCount;
-                st->second.updatedAtUnix = NowUnix();
-            }
-        }
-        if (transfer.receivedCount != transfer.totalChunks) return true;
-        ByteVector assembled;
-        assembled.reserve(static_cast<std::size_t>(offer.fileSize));
-        for (const auto& c : transfer.chunks) assembled.insert(assembled.end(), c.begin(), c.end());
-        fs::path dir = fs::path("downloads") / local_.nodeId / (offer.groupName.empty() ? senderNodeId : offer.groupName);
-        std::error_code ec;
-        fs::create_directories(dir, ec);
-        fs::path dst = dir / parts[4];
-        if (fs::exists(dst)) {
-            for (int n = 1; n < 1000; ++n) {
-                fs::path cand = dir / (dst.stem().string() + "_" + std::to_string(n) + dst.extension().string());
-                if (!fs::exists(cand)) { dst = cand; break; }
-            }
-        }
-        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            utils::LogError("Failed to write downloaded file: " + dst.string());
+        if (seq != transfer.nextExpectedChunk) {
+            utils::LogWarn("Out-of-order file chunk ignored transfer=" + transferId + " expected=" + std::to_string(transfer.nextExpectedChunk) + " got=" + std::to_string(seq));
             return true;
         }
-        out.write(reinterpret_cast<const char*>(assembled.data()), static_cast<std::streamsize>(assembled.size()));
+        if (offsetBytes != transfer.receivedBytes) {
+            utils::LogWarn("File chunk offset mismatch transfer=" + transferId);
+            return true;
+        }
+        std::ofstream out(transfer.tempPath, std::ios::binary | std::ios::app);
+        if (!out) {
+            utils::LogError("Failed to open temp download file: " + transfer.tempPath);
+            return true;
+        }
+        out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
         out.close();
-        pendingIncomingFileOffers_.erase(transferId);
-        incomingFileTransfers_.erase(transferId);
+        std::uint64_t rollingState = Fnv1aInit();
+        try { rollingState = std::stoull(transfer.rollingChecksum, nullptr, 16); } catch (...) { rollingState = Fnv1aInit(); }
+        transfer.rollingChecksum = Fnv1aHex(Fnv1aUpdate(rollingState, chunk));
+        transfer.receivedBytes += static_cast<std::uint64_t>(chunk.size());
+        transfer.nextExpectedChunk += 1;
         auto st = fileTransferStatuses_.find(transferId);
         if (st != fileTransferStatuses_.end()) {
-            st->second.state = FileTransferState::Completed;
+            st->second.state = FileTransferState::Transferring;
+            st->second.currentChunk = seq;
+            st->second.totalChunks = total;
+            st->second.bytesTransferred = transfer.receivedBytes;
             st->second.updatedAtUnix = NowUnix();
+            st->second.deadlineUnix = NowUnix() + transferTimeoutSeconds_;
         }
-        utils::LogSystem("File saved: " + dst.string());
+        if (seq != total) return true;
+        completed = true;
+        pendingIncomingFileOffers_.erase(transferId);
+        auto tmp = transfer.tempPath;
+        auto computedChecksum = transfer.rollingChecksum;
+        incomingFileTransfers_.erase(transferId);
+        fs::path tmpPath(tmp);
+        finalPath = tmpPath;
+        finalPath.replace_extension("");
+        if (offer.fileChecksum.empty() || computedChecksum == offer.fileChecksum) {
+            std::error_code ec;
+            fs::rename(tmpPath, finalPath, ec);
+            if (ec) {
+                { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferFailures; }
+                utils::LogError("Failed to finalize downloaded file: " + ec.message());
+                completed = false;
+            }
+        } else {
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferFailures; }
+            utils::LogError("Downloaded file checksum mismatch for transfer " + transferId);
+            std::error_code ec; fs::remove(tmpPath, ec);
+            completed = false;
+        }
+        auto statusItFinal = fileTransferStatuses_.find(transferId);
+        if (statusItFinal != fileTransferStatuses_.end()) {
+            statusItFinal->second.state = completed ? FileTransferState::Completed : FileTransferState::Failed;
+            statusItFinal->second.updatedAtUnix = NowUnix();
+            statusItFinal->second.bytesTransferred = offer.fileSize;
+        }
     }
+    if (completed) { { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.fileTransferCompletions; } utils::LogSystem("File saved: " + finalPath.string()); }
     return true;
 }
 
@@ -3571,6 +4722,50 @@ bool P2PNode::ApplyFileMetaText(const NodeId& senderNodeId, const std::string& t
     return true;
 }
 
+bool P2PNode::MarkRecentIncomingMessage(MessageId messageId) {
+    std::lock_guard<std::mutex> lock(replayMutex_);
+    if (recentIncomingMessageIds_.contains(messageId)) return false;
+    recentIncomingMessageIds_.insert(messageId);
+    recentIncomingMessageOrder_.push_back(messageId);
+    while (recentIncomingMessageOrder_.size() > maxRecentIncomingMessageIds_) {
+        auto old = recentIncomingMessageOrder_.front();
+        recentIncomingMessageOrder_.pop_front();
+        recentIncomingMessageIds_.erase(old);
+    }
+    replayCacheDirty_ = true;
+    return true;
+}
+
+bool P2PNode::MarkRecentControlReplay(const std::string& replayKey) {
+    std::lock_guard<std::mutex> lock(replayMutex_);
+    if (recentControlReplayKeys_.contains(replayKey)) return false;
+    recentControlReplayKeys_.insert(replayKey);
+    recentControlReplayOrder_.push_back(replayKey);
+    while (recentControlReplayOrder_.size() > maxRecentControlReplayKeys_) {
+        auto old = recentControlReplayOrder_.front();
+        recentControlReplayOrder_.pop_front();
+        recentControlReplayKeys_.erase(old);
+    }
+    replayCacheDirty_ = true;
+    return true;
+}
+
+std::uint64_t P2PNode::GetLocalCapabilityFlags() const {
+    return kCapabilityFileTransferV2 | kCapabilityScenarioTests | kCapabilityReplayWindow | kCapabilityJournalReplay;
+}
+
+bool P2PNode::IsCompatibleHello(const HelloPayload& hello, std::string* reason) const {
+    if (hello.maxSupportedVersion < kProtocolVersion || hello.minSupportedVersion > kProtocolVersion) {
+        if (reason) *reason = "version-range mismatch remote=" + std::to_string(hello.minSupportedVersion) + "-" + std::to_string(hello.maxSupportedVersion) + " local=" + std::to_string(kProtocolVersion);
+        return false;
+    }
+    if ((hello.capabilityFlags & kCapabilityReplayWindow) == 0) {
+        if (reason) *reason = "missing replay-window capability";
+        return false;
+    }
+    return true;
+}
+
 P2PNode::ControlEnvelope P2PNode::ParseControlEnvelope(const PrivateMessagePayload& payload) const {
     ControlEnvelope envelope{};
     envelope.raw = payload.text;
@@ -3597,6 +4792,9 @@ std::string P2PNode::MakeControlStateKey(const ControlEnvelope& envelope) const 
     std::string token;
     if (envelope.parts.size() > 1) token = envelope.parts[1];
     if (token.empty()) token = envelope.senderNodeId;
+    if (envelope.kind == ControlMessageKind::FileChunk && envelope.parts.size() > 2 && !envelope.parts[2].empty()) {
+        token += ":chunk:" + envelope.parts[2];
+    }
     return ControlMessageKindToString(envelope.kind) + ":" + envelope.senderNodeId + ":" + token;
 }
 
@@ -3678,6 +4876,14 @@ void P2PNode::ResumePendingFlows() {
 bool P2PNode::DispatchControlMessage(const ControlEnvelope& envelope) {
     if (envelope.kind == ControlMessageKind::Unknown) return false;
     const auto key = MakeControlStateKey(envelope);
+    std::string replayKey = key;
+    if (envelope.parts.size() > 2) replayKey += ":" + envelope.parts[2];
+    if (envelope.parts.size() > 3 && envelope.kind == ControlMessageKind::FileChunk) replayKey += ":" + envelope.parts[3];
+    if (!MarkRecentControlReplay(replayKey)) {
+        { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.replayDrops; }
+        utils::LogWarn("Ignored replayed control message: " + key);
+        return true;
+    }
     {
         std::lock_guard<std::mutex> lock(controlStateMutex_);
         auto& e = controlStates_[key];
@@ -3922,6 +5128,58 @@ bool P2PNode::TryConnectToKnownNode(const KnownNode& node) {
     return connected;
 }
 
+void P2PNode::LoadNatTraversalConfig() {
+    std::vector<nat::ServerEndpoint> stun;
+    std::vector<nat::ServerEndpoint> turn;
+    nat::ParseServerEndpointListFile("stun_servers.txt", stun);
+    nat::ParseServerEndpointListFile("turn_servers.txt", turn);
+    if (stun.empty()) stun.push_back({"stun.l.google.com", 19302});
+    {
+        std::lock_guard<std::mutex> lock(natMutex_);
+        stunServers_ = std::move(stun);
+        turnServers_ = std::move(turn);
+    }
+}
+
+bool P2PNode::SendStunTurnDatagram(const std::string& ip, std::uint16_t port, const std::vector<std::uint8_t>& data) {
+    if (udpSocket_ == INVALID_SOCKET || ip.empty() || port == 0 || data.empty()) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return false;
+    return sendto(udpSocket_, reinterpret_cast<const char*>(data.data()), static_cast<int>(data.size()), 0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != SOCKET_ERROR;
+}
+
+void P2PNode::TickNatTraversalServices() {
+    std::lock_guard<std::mutex> lock(natMutex_);
+    if (!natClient_) return;
+    const auto now = NowUnix();
+    if (!stunServers_.empty() && (lastStunQueryUnix_ == 0 || now - lastStunQueryUnix_ >= stunRefreshSeconds_)) {
+        const auto& server = stunServers_[nextStunServerIndex_ % stunServers_.size()];
+        if (natClient_->QueryStunBinding(server)) {
+            lastStunQueryUnix_ = now;
+            nextStunServerIndex_ = (nextStunServerIndex_ + 1) % stunServers_.size();
+            { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.stunQueries; }
+        }
+    }
+    if (!turnServers_.empty()) {
+        if (!natClient_->HasActiveTurnAllocation()) {
+            if (lastTurnAttemptUnix_ == 0 || now - lastTurnAttemptUnix_ >= turnRetrySeconds_) {
+                const auto& server = turnServers_[nextTurnServerIndex_ % turnServers_.size()];
+                if (natClient_->StartTurnAllocate(server)) {
+                    lastTurnAttemptUnix_ = now;
+                    nextTurnServerIndex_ = (nextTurnServerIndex_ + 1) % turnServers_.size();
+                }
+            }
+        } else if (lastTurnRefreshUnix_ == 0 || now - lastTurnRefreshUnix_ >= turnRefreshSeconds_) {
+            if (natClient_->RefreshTurnAllocation()) {
+                lastTurnRefreshUnix_ = now;
+                { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.turnRefreshes; }
+            }
+        }
+    }
+}
+
 void P2PNode::RequestReverseConnect(const KnownNode& target) {
     ConnectRequestPayload payload{};
     payload.requesterNodeId = local_.nodeId;
@@ -4047,6 +5305,26 @@ void P2PNode::UdpRecvLoop() {
 }
 
 void P2PNode::HandleUdpDatagram(const std::string& ip, std::uint16_t port, const ByteVector& data) {
+    {
+        std::lock_guard<std::mutex> lock(natMutex_);
+        if (natClient_ && natClient_->HandleDatagram(ip, port, data)) {
+            if (auto stun = natClient_->GetLastBinding()) {
+                std::lock_guard<std::mutex> e(observedEndpointMutex_);
+                localObservedUdpIp_ = stun->mappedIp;
+                localObservedUdpPort_ = stun->mappedPort;
+                localObservedIp_ = stun->mappedIp;
+                localObservedPort_ = local_.listenPort;
+                { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.stunSuccesses; }
+            }
+            if (auto turn = natClient_->GetTurnAllocation(); turn && turn->allocated) {
+                std::lock_guard<std::mutex> e(observedEndpointMutex_);
+                relayedIp_ = turn->relayedIp;
+                relayedPort_ = turn->relayedPort;
+                { std::lock_guard<std::mutex> m(metricsMutex_); ++metrics_.turnAllocations; }
+            }
+            return;
+        }
+    }
     std::size_t offset = 0;
     std::uint32_t magic = 0;
     std::uint16_t kind = 0;

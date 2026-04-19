@@ -2,6 +2,7 @@
 #include "core/app_config.h"
 #include "core/logger.h"
 #include "core/utils.h"
+#include "core/version.h"
 #include "ui/console_ui.h"
 
 #include <filesystem>
@@ -9,10 +10,14 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
+#include <algorithm>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <mmsystem.h>
 #ifdef min
 #undef min
 #endif
@@ -50,40 +55,57 @@ static void PrintHelp() {
         {"/chat <n>", "switch to private chat using /users list"},
         {"/leave", "leave private chat and return to global"},
         {"/sessions", "list private chats"},
-        {"/deletechat <n>", "delete local chat history"}
+        {"/deletechat <n>", "delete local chat history"},
+        {"/post \"<title>\" \"<body>\"", "publish signed public post with title and body visible to everyone"},
+        {"/posts [count]", "show recent verified public posts"}
     });
     p2p::ui::PrintHelpTable("Contacts & trust", {
         {"/addcontact <n>", "add contact from /users list"},
         {"/removecontact <n>", "remove contact from /users list"},
         {"/renamecontact <n> <name>", "rename contact"},
         {"/trust <n>", "mark contact from /contacts as trusted"},
-        {"/untrust <n>", "mark contact from /contacts as untrusted"}
+        {"/untrust <n>", "mark contact from /contacts as untrusted"},
+        {"/block <n>", "block contact from /contacts"},
+        {"/unblock <n>", "unblock contact from /contacts"},
+        {"/safety <n>", "show safety number for contact"},
+        {"/verifykey <n>", "mark contact key as manually verified"},
+        {"/unverifykey <n>", "clear manual key verification"}
     });
     p2p::ui::PrintHelpTable("Devices, groups & files", {
         {"/devices", "show linked devices"},
         {"/linkdevice <contactIndex> [label]", "link selected contact as your device"},
         {"/revokedevice <deviceIndex>", "revoke linked device"},
-        {"/syncdevice <deviceIndex>", "sync recent conversations to device"},
+        {"/syncdevice <deviceIndex>", "sync recent conversations to device (alias: /syncdevices)"},
         {"/groups", "show groups"},
-        {"/creategroup <name>", "create group"},
+        {"/creategroup <name>", "create group (alias: /mkgroup)"},
         {"/groupadd <groupIndex> <contactIndex>", "add member to group"},
         {"/groupremove <groupIndex> <contactIndex>", "remove member from group"},
         {"/grouprole <groupIndex> <contactIndex> <role>", "change member role"},
         {"/groupsync <groupIndex>", "send group snapshot to members"},
         {"/groupmsg <groupIndex> <text>", "send group text message"},
-        {"/sendfile <contactIndex> <path>", "send file to contact"},
-        {"/sendgroupfile <groupIndex> <path>", "send file to group"},
-        {"/pendingfiles", "list pending incoming files"},
+        {"/sendfile <contactIndex> <path>", "send file to contact (alias: /attach)"},
+        {"/sendgroupfile <groupIndex> <path>", "send file to group (alias: /groupattach)"},
+        {"/pendingfiles", "list pending incoming files (alias: /downloads)"},
         {"/download <n>", "accept and download pending file"},
         {"/rejectfile <n>", "reject pending file"},
         {"/transfers", "list file transfer states"},
-        {"/controlstates", "list protocol control states"}
+        {"/cancelfile <n>", "cancel file transfer by /transfers index"},
+        {"/controlstates", "list protocol control states"},
+        {"/searchhistory <contactIndex> <term>", "search local chat history"},
+        {"/exportchat <contactIndex> <path>", "export local chat history"},
+        {"/recordvoice <sec> [name]", "record voice note into voice_notes/"},
+        {"/sendvoice <contactIndex> <name>", "send recorded voice note as file"},
+        {"/playvoice <name|index>", "play local voice note"},
+        {"/voicelist", "list local voice notes"}
     });
     p2p::ui::PrintHelpTable("Diagnostics", {
         {"/status", "show current UI/session status"},
         {"/config", "show effective config"},
         {"/reputation", "show peer reputation scores"},
+        {"/stats", "show runtime metrics"},
+        {"/natstatus", "show NAT/STUN/TURN state"},
         {"/info", "show local node info"},
+        {"/version", "show app and protocol version"},
         {"/exit", "quit"}
     });
     p2p::ui::PrintTip("Regular chat text without a slash is sent to the current target (global or private).");
@@ -100,11 +122,74 @@ static std::optional<p2p::DisplayInvite> ResolveInviteByIndex(const std::vector<
     return std::nullopt;
 }
 
+
+static std::filesystem::path EnsureVoiceNotesDir() {
+    auto dir = std::filesystem::current_path() / "voice_notes";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+static std::string SanitizeVoiceName(std::string name) {
+    if (name.empty()) name = "voice_" + std::to_string(std::time(nullptr));
+    for (char& ch : name) {
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-')) ch = '_';
+    }
+    return name;
+}
+
+static bool RecordVoiceWavBlocking(int seconds, const std::string& rawName, std::filesystem::path* outPath) {
+    if (seconds <= 0 || seconds > 300) return false;
+    const auto dir = EnsureVoiceNotesDir();
+    const auto name = SanitizeVoiceName(rawName);
+    const auto wavPath = dir / (name + ".wav");
+    const std::string alias = "p2pvoice_" + std::to_string(::GetTickCount());
+
+    auto mci = [](const std::string& cmd) {
+        return mciSendStringA(cmd.c_str(), nullptr, 0, nullptr) == 0;
+    };
+
+    mci("close " + alias);
+    if (!mci("open new type waveaudio alias " + alias)) return false;
+    if (!mci("record " + alias)) {
+        mci("close " + alias);
+        return false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    mci("stop " + alias);
+    const std::string saveCmd = "save " + alias + " \"" + wavPath.string() + "\"";
+    bool ok = mci(saveCmd);
+    mci("close " + alias);
+    if (ok && outPath) *outPath = wavPath;
+    return ok;
+}
+
+static bool PlayVoiceWav(const std::filesystem::path& wavPath) {
+    return PlaySoundA(wavPath.string().c_str(), nullptr, SND_FILENAME | SND_SYNC) == TRUE;
+}
+
+static std::vector<std::filesystem::path> ListVoiceWavs() {
+    std::vector<std::filesystem::path> out;
+    auto dir = EnsureVoiceNotesDir();
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() == ".wav") out.push_back(entry.path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    const std::string configPath = "messenger.cfg";
+    std::filesystem::path exePath;
+    wchar_t modulePath[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) != 0) exePath = std::filesystem::path(modulePath).parent_path();
+    const std::string configPath = (exePath.empty() ? std::filesystem::path("messenger.cfg") : (exePath / "messenger.cfg")).string();
     p2p::AppConfig config{};
     std::string configError;
     const bool loadedConfig = p2p::ConfigManager::LoadFromFile(configPath, config, &configError);
@@ -223,6 +308,21 @@ int main(int argc, char* argv[]) {
         } else if (cmd == "/untrust") {
             int idx = 0; iss >> idx;
             if (!node.UntrustContactByIndex(idx)) std::cout << "[Error] Failed to untrust contact\n";
+        } else if (cmd == "/block") {
+            int idx = 0; iss >> idx;
+            if (!node.BlockContactByIndex(idx)) std::cout << "[Error] Failed to block contact\n";
+        } else if (cmd == "/unblock") {
+            int idx = 0; iss >> idx;
+            if (!node.UnblockContactByIndex(idx)) std::cout << "[Error] Failed to unblock contact\n";
+        } else if (cmd == "/safety") {
+            int idx = 0; iss >> idx;
+            if (!node.PrintSafetyNumberByIndex(idx)) std::cout << "[Error] Failed to show safety number\n";
+        } else if (cmd == "/verifykey") {
+            int idx = 0; iss >> idx;
+            if (!node.VerifyContactKeyByIndex(idx)) std::cout << "[Error] Failed to verify key\n";
+        } else if (cmd == "/unverifykey") {
+            int idx = 0; iss >> idx;
+            if (!node.UnverifyContactKeyByIndex(idx)) std::cout << "[Error] Failed to clear key verification\n";
         } else if (cmd == "/connect") {
             std::string ip; int remotePort = 0;
             iss >> ip >> remotePort;
@@ -303,6 +403,31 @@ int main(int argc, char* argv[]) {
             std::getline(iss, text);
             if (!text.empty() && text[0] == ' ') text.erase(0, 1);
             node.BroadcastChat(text);
+        } else if (cmd == "/post") {
+            std::string raw;
+            std::getline(iss, raw);
+            if (!raw.empty() && raw[0] == ' ') raw.erase(0, 1);
+            std::vector<std::string> quoted;
+            bool inQuote = false;
+            std::string cur;
+            for (char c : raw) {
+                if (c == '"') {
+                    inQuote = !inQuote;
+                    if (!inQuote) {
+                        quoted.push_back(cur);
+                        cur.clear();
+                    }
+                } else if (inQuote) {
+                    cur.push_back(c);
+                }
+            }
+            if (quoted.size() != 2 || !node.PublishPost(quoted[0], quoted[1])) {
+                std::cout << "[Error] Usage: /post \"<title>\" \"<body>\"\n";
+            }
+        } else if (cmd == "/posts") {
+            std::size_t count = 20;
+            iss >> count;
+            node.PrintPosts(count);
         } else if (cmd == "/invites") {
             node.PrintInvites();
         } else if (cmd == "/sessions") {
@@ -317,12 +442,12 @@ int main(int argc, char* argv[]) {
         } else if (cmd == "/revokedevice") {
             int idx = 0; iss >> idx;
             if (!node.RevokeDeviceByIndex(idx)) std::cout << "[Error] Failed to revoke device\n";
-        } else if (cmd == "/syncdevices") {
+        } else if (cmd == "/syncdevices" || cmd == "/syncdevice") {
             int idx = 0; iss >> idx;
             if (!node.SyncDeviceByIndex(idx)) std::cout << "[Error] Failed to sync device\n";
         } else if (cmd == "/groups") {
             node.PrintGroups();
-        } else if (cmd == "/mkgroup") {
+        } else if (cmd == "/mkgroup" || cmd == "/creategroup") {
             std::string name; std::getline(iss, name);
             if (!name.empty() && name[0] == ' ') name.erase(0,1);
             if (!node.CreateGroup(name)) std::cout << "[Error] Failed to create group\n";
@@ -343,17 +468,17 @@ int main(int argc, char* argv[]) {
             std::string text2; std::getline(iss, text2);
             if (!text2.empty() && text2[0] == ' ') text2.erase(0,1);
             if (!node.SendGroupMessageByIndex(g, text2)) std::cout << "[Error] Failed to send group message\n";
-        } else if (cmd == "/attach") {
+        } else if (cmd == "/attach" || cmd == "/sendfile") {
             int c = 0; iss >> c;
             std::string path; std::getline(iss, path);
             if (!path.empty() && path[0] == ' ') path.erase(0,1);
             if (!node.SendAttachmentByContactIndex(c, path)) std::cout << "[Error] Failed to send file\n";
-        } else if (cmd == "/groupattach") {
+        } else if (cmd == "/groupattach" || cmd == "/sendgroupfile") {
             int g = 0; iss >> g;
             std::string path; std::getline(iss, path);
             if (!path.empty() && path[0] == ' ') path.erase(0,1);
             if (!node.SendGroupAttachmentByIndex(g, path)) std::cout << "[Error] Failed to send group file\n";
-        } else if (cmd == "/downloads") {
+        } else if (cmd == "/downloads" || cmd == "/pendingfiles") {
             node.PrintPendingFiles();
         } else if (cmd == "/download") {
             int idx = 0; iss >> idx;
@@ -363,16 +488,90 @@ int main(int argc, char* argv[]) {
             if (!node.RejectPendingFileByIndex(idx)) std::cout << "[Error] Failed to reject file\n";
         } else if (cmd == "/transfers") {
             node.PrintFileTransfers();
+        } else if (cmd == "/cancelfile") {
+            int idx = 0; iss >> idx;
+            if (!node.CancelFileTransferByIndex(idx)) std::cout << "[Error] Failed to cancel file transfer\n";
         } else if (cmd == "/controlstates") {
             node.PrintControlStates();
+        } else if (cmd == "/searchhistory") {
+            int idx = 0; iss >> idx;
+            std::string term; std::getline(iss, term);
+            if (!term.empty() && term[0] == ' ') term.erase(0, 1);
+            if (!node.SearchConversationHistoryByContactIndex(idx, term)) std::cout << "[Error] Failed to search history\n";
+        } else if (cmd == "/exportchat") {
+            int idx = 0; iss >> idx;
+            std::string path; std::getline(iss, path);
+            if (!path.empty() && path[0] == ' ') path.erase(0, 1);
+            if (!node.ExportConversationHistoryByContactIndex(idx, path)) std::cout << "[Error] Failed to export chat\n";
+
+        } else if (cmd == "/recordvoice") {
+            int seconds = 0; iss >> seconds;
+            std::string name; iss >> name;
+            std::filesystem::path recorded;
+            if (RecordVoiceWavBlocking(seconds, name, &recorded)) {
+                std::cout << "[INFO] Voice recorded: " << recorded.string() << "\n";
+            } else {
+                std::cout << "[Error] Failed to record voice\n";
+            }
+        } else if (cmd == "/sendvoice") {
+            int c = 0; iss >> c;
+            std::string name; iss >> name;
+            if (name.empty()) {
+                std::cout << "Usage: /sendvoice <contactIndex> <name>\n";
+            } else {
+                auto path = EnsureVoiceNotesDir() / (SanitizeVoiceName(name) + ".wav");
+                if (!std::filesystem::exists(path)) {
+                    std::cout << "[Error] Voice note not found: " << path.string() << "\n";
+                } else if (!node.SendAttachmentByContactIndex(c, path.string())) {
+                    std::cout << "[Error] Failed to send voice\n";
+                }
+            }
+        } else if (cmd == "/playvoice") {
+            std::string arg; iss >> arg;
+            if (arg.empty()) {
+                std::cout << "Usage: /playvoice <name|index>\n";
+            } else {
+                std::filesystem::path path;
+                bool played = false;
+                try {
+                    int idx = std::stoi(arg);
+                    auto voices = ListVoiceWavs();
+                    if (idx > 0 && idx <= static_cast<int>(voices.size())) {
+                        path = voices[static_cast<std::size_t>(idx - 1)];
+                    }
+                } catch (...) {
+                    path = EnsureVoiceNotesDir() / (SanitizeVoiceName(arg) + ".wav");
+                }
+                if (!path.empty() && std::filesystem::exists(path)) {
+                    played = PlayVoiceWav(path);
+                }
+                if (!played) std::cout << "[Error] Failed to play voice\n";
+            }
+        } else if (cmd == "/voicelist") {
+            auto voices = ListVoiceWavs();
+            if (voices.empty()) std::cout << "[INFO] No voice notes\n";
+            else {
+                std::cout << "[INFO] === Voice Notes ===\n";
+                int i = 1;
+                for (const auto& v : voices) {
+                    std::cout << "[" << i++ << "] " << v.filename().string() << "\n";
+                }
+            }
+
         } else if (cmd == "/status") {
             p2p::ui::PrintStatusLine(modeText, targetText, isConnected);
         } else if (cmd == "/reputation") {
             node.PrintPeerReputation();
+        } else if (cmd == "/stats") {
+            node.PrintStats();
+        } else if (cmd == "/natstatus") {
+            node.PrintNatStatus();
         } else if (cmd == "/config") {
             std::cout << p2p::ConfigManager::ToDisplayString(config) << "\n";
         } else if (cmd == "/info") {
             node.PrintInfo();
+        } else if (cmd == "/version") {
+            std::cout << "PeerLink v" << p2p::kAppVersion << " (protocol " << p2p::kProtocolVersion << ")\n";
         } else if (cmd == "/exit") {
             break;
         } else {
